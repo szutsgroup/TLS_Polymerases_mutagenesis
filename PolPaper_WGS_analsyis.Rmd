@@ -1,0 +1,2434 @@
+---
+title: "20211106_RPE1_WGS_Results.Rmd"
+author: "Zsolt Gyure"
+date: "06 November 2021"
+output: 
+    html_notebook:
+      fig.height: 5
+      fig.width: 10
+      highlight: zenburn
+      toc: yes
+      toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r setup2, warning = FALSE, message = FALSE}
+options(stringsAsFactors = FALSE)
+
+library(tidyverse)
+library(reshape2)
+library(ggplot2)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(MutationalPatterns)
+library(deconstructSigs)
+
+# most important user-defined variables: working directory, output base name and sample-specific genotype and treatment info
+# these are the only things you have to change for eah Isomut run.
+outDir <- ""
+outBase <- ""
+# treatments
+treatments <- list(
+  starting_clones = c("RS009", "RS017","RS025","RS021","RS037", "RS041", "RS062","RS103"), 
+  
+  mock = c(paste0("RS0", c(11:13, 58)),
+          paste0("RS0", c(18:20, 61)),
+          paste0("RS0", 22:24),
+          paste0("RS0", 26:28),
+          paste0("RS0", 38:40),
+          paste0("RS0", 42:44),
+          paste0("RS0", 63:65),
+          paste0("RS", 104:106)
+          )
+)
+
+# genotypes
+genotypes <- list(
+
+  REV1 = paste0("RS0", c(17:20, 61)),
+  
+  PRIMPOL = paste0("RS0", c(21:24)),
+  
+  REV1_PRIMPOL = paste0("RS0", 25:28),
+  
+  WT_P53 = paste0("RS", c("009", "011", "012", "013", "058")),
+  
+  K164R = paste0("RS0", c(37:40)),
+  
+  K164R_PRIMPOL = paste0("RS0", c(41:44)),
+  
+  REV3L = paste0("RS0", 62:65),
+  
+  K164R_REV1 = paste0("RS", 103:106)
+  
+)
+
+clones <- list(
+  starting = paste0("RS", c("009", "017", "021", "025", "037", "041", "062", "103")),
+  clone1 = paste0("RS", c("011", "019", "022", "026", "038", "042", "063", "104")),
+  clone2 = paste0("RS", c("013", "020", "023", "027", "039", "043", "064", "105")),
+  clone3 = paste0("RS", c("058", "061", "024", "028", "040", "044", "065", "106"))
+)
+
+
+problematic <- c("RS009","RS012","RS018", "RS021")
+```
+
+## Samples in this round
+
+All TK6 samples from round4 run, the extra ones are the three new platinum-treated lines from round5 and round6.
+
+## Isomut treshold selection { .tabset }
+
+First we need to select a treshold for the scores given by Isomut under which we don't believe an event to be a true mutation. A separate treshold have to be found for SNVs, insertions and deletions. The criteria are:
+
+* SNVs: the treshold is the minimal score that leaves at most 5 SNVs in any of the starting clone samples.
+* Insertions and deletions: the treshold is the minimal score that leaves at most 1 event in any of the starting clone samples.
+
+### SNVs
+
+```{r treshold.selection.snv}
+
+snv <- read.delim(file.path(outDir, "analysis/data_input/all_SNVs_after3rdround.isomut"))
+
+snv <- dplyr::filter(snv, grepl("RS", X.sample_name))
+snv$sample <- sub("_RMdup_IR.bam", "", snv$X.sample_name)
+
+samplenum <- length(table(snv$sample))
+
+csnv <- matrix(ncol = samplenum, nrow = 301)
+csnv[] <- 0
+for (i in 1:301) { csnv[i,] <- as.vector(tabulate(factor(filter(snv, score > (i-1)/10)$X.sample_name, levels = names(table(snv$X.sample_name))), nbins = samplenum)) }
+csnv <- data.frame(csnv, stringsAsFactors = FALSE)
+names(csnv) <- names(table(snv$sample))
+csnv$treshold <- seq(0, 30, by = 0.1)
+csnvm <- melt(csnv, id = "treshold")
+csnvm$status <- ifelse(csnvm$variable %in% treatments$starting_clones, "starting_clone", "other")
+csnvm$status <- ifelse(csnvm$variable %in% problematic, "problematic", csnvm$status)
+
+csnvm %>%
+  filter(status == "starting_clone") %>%
+  ggplot( aes(x = treshold, y = log(value, base = 10), group = variable, color = variable)) + 
+  geom_line() + ylab("log10 (Mutation number) ") + 
+  xlab("Score treshold") + 
+  xlim(0,20) +
+  geom_hline(yintercept = log10(5), linetype = 2)
+
+dir.create(paste0(outDir, "/analysis/data_output/"), recursive = TRUE)
+write.csv(csnv, paste0(outDir, "/analysis/data_output/_snv_tresholds.csv"), quote = FALSE, row.names = FALSE) 
+
+csnv[ ,c(setdiff(treatments$starting_clones, problematic), "treshold")] %>% 
+  apply(1, function(x) ifelse(sum(x[1:length(setdiff(treatments$starting_clones, problematic))] < 5) == length(setdiff(treatments$starting_clones, problematic)), x[length(setdiff(treatments$starting_clones, problematic)) + 1], NA)) %>% 
+  min(na.rm = TRUE) -> snvScore
+
+```
+
+```{r}
+snv_filt %>%
+  filter(score > snvScore) %>%
+  filter(treatment == "mock") %>%
+  mutate(sample_name = factor(sample_name, levels  = paste(rep(c("WT_P53", "REV1", "REV3L", "PRIMPOL", "K164R", "REV1_PRIMPOL","K164R_PRIMPOL", "K164R_REV1"), each = 3), rep(c("clone1", "clone2", "clone3"), times = 8), sep = "_" ))) %>%
+  ggplot() +
+  geom_density(aes(x = mut_freq)) +
+  geom_vline(xintercept = (0.5), color = "blue") +
+  theme_minimal() +
+  xlim(0,1) +
+  facet_wrap(~sample_name, nrow = 4) -> mut_freq
+
+
+dir.create(paste0(outDir, "/plots/general_plots/"), recursive = TRUE)
+ggsave(paste0(outDir, "/plots/general_plots/202301_mut_freq_density_plot.pdf"), mut_freq, width = 15, height = 8)
+```
+
+The treshold will be that lowest Fisher score that leaves less than 5 events in each starting clone samples. For SNVs, it is 
+```{r} 
+csnv[ ,c(setdiff(treatments$starting_clones, problematic), "treshold")] %>% 
+  apply(1, function(x) ifelse(sum(x[1:length(setdiff(treatments$starting_clones, problematic))] < 5) == length(setdiff(treatments$starting_clones, problematic)), x[length(setdiff(treatments$starting_clones, problematic)) + 1], NA)) %>% 
+  min(na.rm = TRUE)
+``` 
+
+### Insertions
+```{r treshold.selection.ins}
+indel <- read.delim(file.path(outDir, "analysis/data_input/all_indels.isomut"))
+indel <- dplyr::filter(indel, grepl("RS", X.sample_name))
+
+indel$sample <- sub("_RMdup_IR.bam", "", indel$X.sample_name)
+
+
+samplenum <- length(table(indel$X.sample_name))
+
+ins <- filter(indel, type == "INS")
+cins <- matrix(ncol = samplenum, nrow = 201); cins[] <- 0
+for (i in 1:201) { cins[i,] <- as.vector(tabulate(factor(filter(ins, score > (i-1)/10)$X.sample_name, levels = names(table(snv$X.sample_name))), nbins = samplenum)) }
+cins <- data.frame(cins, stringsAsFactors = FALSE)
+names(cins) <- names(table(indel$sample))
+cins$treshold <- seq(0, 20, by = 0.1)
+cinsm <- melt(cins, id = "treshold")
+cinsm$status <- ifelse(cinsm$variable %in% treatments$starting_clone, "starting_clones", "other")
+cinsm$status <- ifelse(cinsm$variable %in% problematic, "problematic", cinsm$status)
+ggplot(data = cinsm, aes(x = treshold, y = log(value, base = 10), group = variable, color = status)) + geom_line() + ylab("log10 (Insertion number)") + xlab("Score treshold") + geom_hline(yintercept = log10(1), linetype = 2)
+
+write.csv(cins, paste0(outDir, "/analysis/data_output/_ins_tresholds.csv"), quote = FALSE, row.names = FALSE)
+
+cinsm %>%
+  filter(status == "starting_clones") %>%
+  ggplot(aes(x = treshold, y = log(value, base = 10), group = variable, color = variable)) + 
+  geom_line() + 
+  ylab("log10 (Insertion number)") + 
+  xlab("Score treshold") + 
+  geom_hline(yintercept = log10(1), linetype = 2)
+
+
+```
+The treshold will be that lowest Fisher score that leaves at most 1 event in each starting clone samples. For insertions, it is 
+```{r} 
+cins[ ,c(setdiff(treatments$starting_clones, problematic), "treshold")] %>% apply(1, function(x) ifelse(sum(x[1:length(setdiff(treatments$starting_clones, problematic))] < 5) == length(setdiff(treatments$starting_clones, problematic)), x[length(setdiff(treatments$starting_clones, problematic)) + 1], NA)) %>% min(na.rm = TRUE)
+```
+
+### Deletions
+
+```{r treshold.selection.del}
+del <- dplyr::filter(indel, type == "DEL")
+cdel <- matrix(0, ncol = samplenum, nrow = 201)
+for (i in 1:201) { cdel[i,] <- as.vector(tabulate(factor(filter(del, score > (i-1)/10)$X.sample_name, levels = names(table(del$X.sample_name))), nbins = samplenum)) }
+
+cdel <- data.frame(cdel, stringsAsFactors = FALSE)
+names(cdel) <- names(table(sub("_RMdup_IR.bam", "", snv$X.sample_name)))
+cdel$treshold <- seq(0, 20, by = 0.1)
+cdelm <- melt(cdel, id = "treshold")
+cdelm$status <- ifelse(cdelm$variable %in% treatments$starting_clones, "starting_clones", "other")
+cdelm$status <- ifelse(cdelm$variable %in% problematic, "problematic", cdelm$status)
+
+cdelm %>%
+  filter(status == "starting_clones") %>%
+  ggplot(aes(x = treshold, y = log(value, base = 10), group = variable, color = variable)) + 
+  geom_line() + ylab("log10 (Deletion number) ") + xlab("Score treshold") + 
+  geom_hline(yintercept = log10(1), linetype = 2)
+
+write.csv(cdel,  paste0(outDir, "/analysis/data_output/_del_tresholds.csv"), quote = FALSE, row.names = FALSE)
+```
+
+
+The treshold will be that lowest Fisher score that leaves at most 1 event in each starting clone samples. For deletions, it is 
+```{r} 
+cdel[ ,c(setdiff(treatments$starting_clones, problematic), "treshold")] %>% apply(1, function(x) ifelse(sum(x[1:length(setdiff(treatments$starting_clones, problematic))] < 5) == length(setdiff(treatments$starting_clones, problematic)), x[length(setdiff(treatments$starting_clones, problematic)) + 1], NA)) %>% min(na.rm = TRUE)
+``` 
+
+## SNVs
+
+### SNV numbers
+
+First let's have a look on the total number of SNVs left after filtering for the Fisher score treshold. 
+
+```{r total.number.snv}
+
+snv_filt <- filter(snv, score > snvScore , chr != "MT" , !(grepl(paste(problematic, collapse = "|"), X.sample_name)))
+
+snv_filt$sample <- sub("_RMdup_IR.bam", "", snv_filt$X.sample_name)
+snv_filt$sample <- sub("_RMdup.bam", "", snv_filt$sample)
+
+# factor(snv_filt$sample, levels = unlist(treatments)) %>%
+# tabulate() %>%
+# barplot(las = 2, names.arg = unlist(treatments), ylab = paste0("Number of SNVs with score >= ", snvScore))
+
+snv_filt$genotype <- NA
+for (i in 1:length(genotypes)) {
+  snv_filt[which(snv_filt$sample %in% genotypes[[i]]), "genotype"] <- names(genotypes)[i]  
+}
+
+snv_filt$treatment <- NA
+for (i in 1:length(treatments)) {
+  snv_filt[which(snv_filt$sample %in% treatments[[i]]), "treatment"] <- names(treatments)[i]  
+}
+
+snv_filt$clone <- NA
+for (i in 1:length(clones)) {
+  snv_filt[which(snv_filt$sample %in% clones[[i]]), "clone"] <- names(clones)[i]
+}
+
+
+levels = paste(rep(c("WT_P53", "REV1", "REV3L", "PRIMPOL", "K164R", "REV1_PRIMPOL","K164R_PRIMPOL", "K164R_REV1"), each = 3), rep(c("clone1", "clone2", "clone3"), times = 8), sep = "_" )
+
+snv_filt %>%
+  mutate(sample_name = paste(genotype, clone, sep = "_")) %>%
+  mutate(sample_name = factor(sample_name ,levels = levels ) ) %>%
+  dplyr::select(-clone) -> snv_filt
+
+snv_filt$treatment <- factor(snv_filt$treatment, levels = names(treatments))
+snv_filt$genotype <- factor(snv_filt$genotype, levels = names(genotypes))
+
+ group_by(snv_filt, genotype, treatment, sample) %>%
+  summarize(SNVnumber = n()) %>% 
+  as.data.frame() -> snv_numbers
+
+write.csv(snv_numbers,  paste0(outDir, "/analysis/data_output/_snv_numbers.csv"), quote = FALSE, row.names = FALSE)
+
+snv_numbers <- filter(snv_numbers, treatment == "mock")
+
+gtypes = c("WT_P53","REV1","REV3L","PRIMPOL","K164R","REV1_PRIMPOL","K164R_PRIMPOL","K164R_REV1")
+
+for (i in 1:length(gtypes)){
+  gtype = gtypes[i]
+  x = snv_numbers[snv_numbers$genotype == gtype,]$SNVnumber
+  y = snv_numbers[snv_numbers$genotype == "WT_P53",]$SNVnumber
+  
+  test <- t.test(x = x, y = y, var.equal = TRUE)
+  print(paste(gtype, test$p.value, sep = " "))
+}
+
+```
+
+### SNV number barplot
+```{r}
+snv_filt  %>%
+  filter(treatment == "mock") %>%
+  group_by(genotype, treatment, sample) %>%
+  summarize(SNVnumber = n()) %>% 
+  as.data.frame() %>%
+  group_by(genotype, treatment) %>%
+  mutate(SNVsum = sum(SNVnumber), 
+         SNVmean = mean(SNVnumber), 
+         SNVsem = sd(SNVnumber) / sqrt(n()), 
+         SNVsd = sd(SNVnumber),
+         genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) %>% 
+  ggplot(aes(x = genotype, fill = treatment, y = SNVmean)) + 
+  geom_bar(stat = 'identity', position = 'dodge', color = "black", fill = "grey", alpha = 0.3, show.legend = FALSE) + 
+  geom_errorbar(aes(ymin = SNVmean - SNVsem, ymax = SNVmean + SNVsem), position = position_dodge(width = 0.9), width = 0.5) + 
+  geom_point(aes(x = genotype, y = SNVnumber, color = "red"), position=position_jitterdodge(jitter.width=0.5), size = 2, show.legend = FALSE ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, face = "bold", hjust = 1 )) +
+  xlab("genotype") +
+  ylab("SNV numbers") -> snv_plot_filt
+
+ggsave(paste0(outDir, "/plots/general_plots/202301_polpaper_SNV_filt_plot.pdf"),snv_plot_filt, width = 5, height = 4.5 )
+
+snv_filt_plot
+```
+
+### Triplet spectra
+```{r triplet.spectra, message = FALSE, fig.width = 20, cache = TRUE}
+nice_palette <- c("#E16A86", "#B88A00", "#50A315", "#00AD9A", "#009ADE", "#C86DD7")
+snv_filt$chr <- gsub("MT", "M", snv_filt$chr)
+snv_filt$chr <- factor(snv_filt$chr, levels = c(1:22, "X", "Y"))
+snv_range <- GRanges(paste0("chr",snv_filt$chr), ranges = IRanges(snv_filt$pos -  1, end = snv_filt$pos + 1))
+snv_seq <- getSeq(Hsapiens, snv_range)
+snv_filt$tripmut <- paste0(as.character(snv_seq), snv_filt$mut)
+tmp <- DNAStringSet(snv_filt$mut)
+snv_filt$tripmut96 <- ifelse((snv_filt$ref == "C" |snv_filt$ref == "T"), 
+                         snv_filt$tripmut, 
+                             paste0(unname(as.character(reverseComplement(snv_seq))), 
+                                   unname(as.character(reverseComplement(tmp)))
+                                   )
+                             )
+snv_filt$sorting=paste0(substr(snv_filt$tripmut96, 2, 2), 
+                 ">",
+                 substr(snv_filt$tripmut96, 4, 4),
+                 "::", 
+                 substr(snv_filt$tripmut96, 1, 1), 
+                 "_", 
+                 substr(snv_filt$tripmut96, 3, 3))
+
+snv_spectra <- as.data.frame.matrix(table(snv_filt$sample_name, snv_filt$sorting))
+write.table(snv_spectra, paste0(file.path(outDir, outBase), "_triplet.csv"))
+paste0("mkdir ", outDir, "/plots/spectrum_plots/") %>% system()
+for (i in 1:length(rownames(snv_spectra))) {
+  pdf(paste0(outDir, "/plots/spectrum_plots/", rownames(snv_spectra)[i], ".pdf"), width = 10, height = 5) 
+  barplot(as.integer(snv_spectra[i,]), las = 2, names.arg = colnames(snv_spectra), cex.names = 0.8, col = rep(nice_palette, each = 16), main = rownames(snv_spectra)[i])
+  dev.off()
+}
+```
+
+### Triplet spectra aggregated 
+
+Three sets of plots are generated:
+  * averaged spectra by groups
+  * averaged spectra by groups with set y scales
+  * averaged spectra by groups, normalized for human triplet frequencies
+
+```{r}
+snv_spectra <- as.data.frame.matrix(table(snv_filt$sample, snv_filt$sorting))
+snv_spectra$Sample <- rownames(snv_spectra)
+snv_spectra$Genotype <- NA
+for (i in names(genotypes)) {
+  snv_spectra[which(snv_spectra$Sample %in% genotypes[[i]]), "Genotype"] <- i
+}
+snv_spectra$Treatment <- NA
+for (i in names(treatments)) {
+  snv_spectra[which(snv_spectra$Sample %in% treatments[[i]]), "Treatment"] <- i
+}
+
+group_by(snv_spectra, Genotype, Treatment) %>% 
+  summarize_at(vars(contains(">")), list(mean)) %>%
+  as.data.frame() %>%
+  filter(Treatment == "mock") -> tripAveByGT
+
+spaces <- rep(c(2, rep(0.4, 15)), 6)
+
+colors <- c(rgb(207/255, 19/255, 129/255), 
+           rgb(111/255, 53/255, 132/255),
+           rgb(90/255, 200/255, 209/255), 
+           rgb(44/255, 53/255, 138/255), 
+           rgb(20/255, 138/255, 76/255), 
+           rgb(253/255, 209/255, 45/255))
+
+trips <- colnames(tripAveByGT)[-c(1,2)] 
+trips <- paste0(substr(trips, 6, 6), substr(trips, 1, 1), substr(trips, 8, 8))
+
+dir.create(paste0(outDir, "/plots/averaged_spectrum_plots/"), recursive = TRUE)
+for (i in 1:nrow(tripAveByGT)) {
+  pdf(paste0(outDir, "/plots/averaged_spectrum_plots/", paste(tripAveByGT[i,1:2], collapse = "_"), "_averaged.pdf"), width = 20, height = 7)
+  opar <- par()
+  par(mar = c(5.1, 7.1, 4.1, 2.1))
+  yscale <- c(0, max(as.numeric(tripAveByGT[i,3:98]))*1.2)
+  #yscale <- c(0, 140)
+  barplot(as.numeric(tripAveByGT[i,3:98]), 
+          main = paste(tripAveByGT[i,1:2], collapse = " "), 
+          col = rep(colors, each = 16), 
+          las = 2, 
+          names.arg = trips, 
+          cex.names = 1.3, 
+          space = spaces, 
+          cex.main = 2, 
+          #ylim = yscale, 
+          border = NA, 
+          cex.axis = 1.6, 
+          family = "mono", 
+          lwd = 8)
+  for (j in 1:6) {
+    rect(xleft = 2 + (j-1) * (2 + (16*1 + 15*0.4)), ybottom = (par("usr")[4] ->  par("usr")[3]) * 0.97, xright = j * (15*1.4 + 2 + 1), ytop = par("usr")[4], col = colors[j], border = NA)
+    text(label = c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G")[j], x = (j ->  1) * (15*1.4 + 2) + j + 11.5, y = (par("usr")[4] ->  par("usr")[3]) * 0.93, cex = 2, font = 2, family = "mono")
+  }
+  dev.off()
+}
+
+dir.create(paste0(outDir, "/plots/averaged_spectrum_plots_samescale/"), recursive = TRUE)
+for (i in 1:nrow(tripAveByGT)) {
+  pdf(paste0(outDir, "/plots/averaged_spectrum_plots_samescale/", paste(tripAveByGT[i,1:2], collapse = "_"), "_averaged_samescale.pdf"), width = 20, height = 7)
+  opar <- par()
+  par(mar = c(5.1, 7.1, 4.1, 2.1))
+  yscale <- c(0,max(as.numeric(as.matrix(tripAveByGT[,3:98])))*1.2
+  )
+  barplot(as.numeric(tripAveByGT[i,3:98]), 
+          main = paste(tripAveByGT[i,1:2], collapse = " "), 
+          col = rep(colors, each = 16), 
+          las = 2, 
+          names.arg = trips, 
+          cex.names = 1.3, 
+          space = spaces, 
+          cex.main = 2, 
+          ylim = yscale, 
+          border = NA, 
+          cex.axis = 1.6, 
+          family = "mono", 
+          lwd = 8)
+  for (j in 1:6) {
+    rect(xleft = 2 + (j-1) * (2 + (16*1 + 15*0.4)), ybottom = (par("usr")[4] ->  par("usr")[3]) * 0.97, xright = j * (15*1.4 + 2 + 1), ytop = par("usr")[4], col = colors[j], border = NA)
+    text(label = c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G")[j], x = (j ->  1) * (15*1.4 + 2) + j + 11.5, y = (par("usr")[4] ->  par("usr")[3]) * 0.93, cex = 2, font = 2, family = "mono")
+  }
+  dev.off()
+}
+
+tripfreq <- read.delim(file.path(outDir, "analysis/data_input/tripfreq.csv"), stringsAsFactors = FALSE, sep = ";", dec = ",")
+tripfreq <- tripfreq[,c(1,3)]
+tripfreq$Count <- tripfreq$Homo.sapiens * sum(as.numeric(seqlengths(Hsapiens)[1:24]))
+tripfreq <- rbind(tripfreq[1:16,], tripfreq[1:16,], tripfreq[1:16,], tripfreq[17:32,], tripfreq[17:32,], tripfreq[17:32,])
+
+tripNormAveByGT <- cbind(tripAveByGT[,1:2], sweep(tripAveByGT[,3:98], 2, tripfreq$Count, "/")) 
+
+dir.create(paste0(outDir, "/plots/averaged_spectrum_plots_normalized/"), recursive = TRUE)
+for (i in 1:nrow(tripNormAveByGT)) {
+  pdf(paste0(outDir, "/plots/averaged_spectrum_plots_normalized/", paste(tripAveByGT[i,1:2], collapse = "_"), "_averaged.pdf"), width = 20, height = 7)
+  opar <- par()
+  par(mar = c(5.1, 7.1, 4.1, 2.1))
+  #yscale <- c(0, max(as.numeric(tripNormAveByGT[i,3:98]))*1.2)
+  yscale <- c(0, 5.5e-7)
+  barplot(as.numeric(tripNormAveByGT[i,3:98]), 
+          main = paste(tripNormAveByGT[i,1:2], collapse = " "), 
+          col = rep(colors, each = 16), 
+          las = 2, 
+          names.arg = trips, 
+          cex.names = 1.3, 
+          space = spaces, 
+          cex.main = 2, 
+          ylim = yscale, 
+          border = NA, 
+          cex.axis = 1.6, 
+          family = "mono", 
+          lwd = 8)
+  for (j in 1:6) {
+    rect(xleft = 2 + (j-1) * (2 + (16*1 + 15*0.4)), ybottom = (par("usr")[4] ->  par("usr")[3]) * 0.97, xright = j * (15*1.4 + 2 + 1), ytop = par("usr")[4], col = colors[j], border = NA)
+    text(label = c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G")[j], x = (j ->  1) * (15*1.4 + 2) + j + 11.5, y = (par("usr")[4] ->  par("usr")[3]) * 0.93, cex = 2, font = 2, family = "mono")
+  }
+  dev.off()
+}
+```
+
+
+### Rainfall plots
+
+```{r waterfall}
+seqNames <- seqnames(Hsapiens)[1:24]
+seqLengths <-  as.numeric(seqlengths(Hsapiens)[1:24])
+cumulativeLengths <- Reduce(sum, seqLengths, accumulate = TRUE)
+genomeLength <- sum(seqLengths)
+
+normalizeGenomicPositions <- function(chr, pos) {
+  pos <- as.numeric(pos)
+  whichChrom <- which(seqNames %in% chr)
+  earlierChromsLength <- sum(seqLengths[0:(whichChrom - 1)])
+  return(as.numeric(earlierChromsLength) + pos)
+}
+
+snv_filt <- arrange(snv_filt, sample, chr, pos) %>%
+  group_by(sample) %>%
+  mutate(nextmut = c(pos[-1], NA) - pos,
+         nextmut = ifelse(nextmut < 0, NA, nextmut),
+         refalt = paste0(ref, ">", mut),
+         coloring = as.numeric(factor(substr(sorting, 0, 3), levels = c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G"))))
+
+
+snv_filt$normPos <- apply(snv_filt, 1, function(x) normalizeGenomicPositions(x[2], x[3]))
+
+paste0("mkdir ", outDir, "/plots/rainfall_plots/") %>% system()
+
+for (i in sort(unique(snv_filt$sample))) {
+  pdf(paste0(outDir, "/plots/rainfall_plots/", i, ".pdf"), width = 10, height = 5) 
+  tmp <- filter(snv_filt, sample == i)
+  par(mar = c(6.1, 4.1, 4.1, 6.1), xpd = TRUE)
+  with(tmp, plot(x = normPos, y = log10(nextmut), xlim = c(1, genomeLength), main = i, ylab = "log10 of mutational distances", xlab = "Position along the genome", ylim = c(0, 8), col = nice_palette[coloring], pch = 16))
+  segments(x0 = cumulativeLengths, y0 = -0.1, y1 = 8.1, col = "grey70", lty = 2)
+  legend(x = "topright", legend = c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G"), col = nice_palette, inset = c(-0.12, 0), pch = 15, cex = 1.2)
+  dev.off()
+}
+
+write.table(snv_filt, file = paste0(outDir, "/analysis/data_output/all_SNVs_postprocessed.isomut"), row.names = FALSE, quote = FALSE)
+
+```
+
+### Finding and plotting close mutations
+```{r}
+
+filter(snv_filt, nextmut < 100 & nextmut > 1) -> tmp
+
+table(tmp$sample_name) %>% 
+  as.data.frame() -> tmp2
+
+missing <- setdiff(as.vector(base::unique(snv_filt$sample_name)), as.vector(base::unique(tmp2$Var1)))
+
+missing <- missing[!is.na(missing)]
+
+tmp3 <- data_frame("Var1" = missing, "Freq" = rep(0, times = length(missing)))
+
+tmp4 <- rbind(tmp2, tmp3)
+
+tmp4 %>%
+  as.data.frame() %>%
+  mutate(genotype = str_remove(Var1, regex("_clone[123]"))) %>%
+  group_by(genotype) %>%
+  mutate(sum = sum(Freq), 
+         mean = mean(Freq), 
+         sem = sd(Freq) / sqrt(n()), 
+         sd = sd(Freq),
+         genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) %>%
+  ggplot(aes(x = genotype, y = mean)) + 
+  geom_bar(stat = 'identity', position = 'dodge', color = "black", fill = "grey", alpha = 0.3, show.legend = FALSE) + 
+  geom_errorbar(aes(ymin = mean - sem, ymax = mean + sem), position = position_dodge(width = 0.9), width = 0.5) + 
+  geom_point(aes(x = genotype, y = Freq, color = "red"), position=position_jitterdodge(jitter.width=0.5), size = 2, show.legend = FALSE ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, face = "bold", hjust = 1 )) +
+  xlab("genotype") +
+  ylab("close mutation ( 2-100 ) numbers") -> close_mut 
+
+ggsave(paste0(outDir, "/plots/general_plots/202301_polpaper_close_mut_plot.pdf"), close_mut, width = 5, height = 4.5 )
+
+close_mut
+
+```
+
+### Finding and plotting dinucleotid mutations
+```{r}
+
+filter(snv_filt, nextmut == 1) -> tmp
+
+table(tmp$sample_name) %>% 
+  as.data.frame() -> tmp2
+
+missing <- setdiff(as.vector(base::unique(snv_filt$sample_name)), as.vector(base::unique(tmp2$Var1)))
+
+missing <- missing[!is.na(missing)]
+
+tmp3 <- data_frame("Var1" = missing, "Freq" = rep(0, times = length(missing)))
+
+tmp4 <- rbind(tmp2, tmp3)
+
+tmp4 %>%
+  mutate(genotype = str_remove(Var1, regex("_clone[123]"))) %>%
+  select(c(genotype, Var1, Freq))-> tmp5
+
+colnames(tmp5) <- c("genotype", "sample", "DNVnumber")
+  
+
+for (i in 1:length(gtypes)){
+  gtype = gtypes[i]
+  #print(gtype)
+  x = tmp5[tmp5$genotype == gtype,]$DNVnumber
+  y = tmp5[tmp5$genotype == "WT_P53",]$DNVnumber
+  
+  #print(paste0("sample: ",round(mean(x), 2), " +/-" , round(sd(x), 2)))
+  #print(paste0("control: ",round(mean(y), 2), " +/-" , round(sd(y), 2)))
+  
+  test <- t.test(x = x, y = y, var.equal = TRUE)
+  if (test$p.value < 0.05) {
+    print(paste(gtype, test$p.value, "*",sep =  " "))
+  } else {
+    print(paste(gtype, test$p.value, "ns", sep =  " "))
+  }
+
+  # print("Finished")
+  # print("")
+}
+
+tmp4 %>%
+  mutate(genotype = str_remove(Var1, regex("_clone[123]"))) %>%
+  group_by(genotype) %>%
+  mutate(sum = sum(Freq), 
+         mean = mean(Freq), 
+         sem = sd(Freq) / sqrt(n()), 
+         sd = sd(Freq),
+         genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) -> tmp
+
+tmp%>%
+  ggplot(aes(x = genotype, y = mean)) + 
+  geom_bar(stat = 'identity', position = 'dodge', color = "black", fill = "grey", alpha = 0.3, show.legend = FALSE) + 
+  geom_errorbar(aes(ymin = mean - sem, ymax = mean + sem), position = position_dodge(width = 0.9), width = 0.5) + 
+  geom_point(aes(x = genotype, y = Freq, color = "red"), position=position_jitterdodge(jitter.width=0.5), size = 2, show.legend = FALSE ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, face = "bold", hjust = 1 )) +
+  xlab("genotype") +
+  ylab("dinucleotid mutation numbers") -> dinuc_plot
+
+ggsave(paste0(outDir, "/plots/general_plots/202301_polpaper_dinucleotid_mut_plot.pdf"), dinuc_plot, width = 5, height = 4.5 )
+
+```
+
+## Short indels
+
+### Insertion numbers, statistic and plotting
+
+```{r total.number.ins}
+insScore <- cins[ ,c(setdiff(treatments$starting_clones, problematic), "treshold")] %>% 
+  apply(1, function(x) ifelse(sum(x[1:length(setdiff(treatments$starting_clones, problematic))] < 5) == length(setdiff(treatments$starting_clones, problematic)), x[length(setdiff(treatments$starting_clones, problematic)) + 1], NA)) %>% 
+  min(na.rm = TRUE)
+
+
+
+ins_filt <- filter(ins, score > insScore , chr != "MT" , !(grepl(paste(problematic, collapse = "|"), X.sample_name)))
+
+ins_filt$sample <- sub("_RMdup_IR.bam", "", ins_filt$X.sample_name)
+ins_filt$sample <- sub("_RMdup.bam", "", ins_filt$sample)
+factor(ins_filt$sample, levels = sort(unique(snv$sample))) %>% 
+tabulate() %>% 
+barplot(las = 2, names.arg = sort(unique(snv$sample)), ylab = paste0("Number of insertions with score >= ", insScore))
+
+ins_filt$genotype <- NA
+for (i in 1:length(genotypes)) {
+  ins_filt[which(ins_filt$sample %in% genotypes[[i]]), "genotype"] <- names(genotypes)[i]  
+}
+
+ins_filt$treatment <- NA
+for (i in 1:length(treatments)) {
+  ins_filt[which(ins_filt$sample %in% treatments[[i]]), "treatment"] <- names(treatments)[i]  
+}
+
+ins_filt$treatment <- factor(ins_filt$treatment, levels = names(treatments))
+ins_filt$genotype <- factor(ins_filt$genotype, levels = names(genotypes))
+
+group_by(ins_filt, genotype, treatment, sample) %>%
+  summarize(INSnumber = n()) %>% 
+  as.data.frame() -> ins_numbers
+
+write.csv(ins_numbers,  paste0(outDir, "/analysis/data_output/_ins_numbers.csv"), quote = FALSE, row.names = FALSE)
+
+ins_numbers <- filter(ins_numbers, treatment == "mock")
+
+for (i in 1:length(gtypes)){
+  gtype = gtypes[i]
+  
+  x = ins_numbers[ins_numbers$genotype == gtype,]$INSnumber
+  y = ins_numbers[ins_numbers$genotype == "WT_P53",]$INSnumber
+  
+  test <- t.test(x = x, y = y, var.equal = TRUE)
+  print(paste(gtype, test$p.value, sep = " "))
+}
+```
+
+
+```{r}
+ins_filt %>%
+  #filter(!(grepl("WT_Cas9", genotype))) %>%
+  filter(treatment == "mock") %>%
+  group_by(genotype, treatment, sample) %>%
+  summarize(INSnumber = n()) %>% 
+  as.data.frame() %>%
+  group_by(genotype, treatment) %>%
+  mutate(INSsum = sum(INSnumber), 
+            Insertions = mean(INSnumber), 
+            INSsem = sd(INSnumber) / sqrt(n()), 
+            INSsd = sd(INSnumber),
+            genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) %>% 
+  ggplot(aes(x = genotype, fill = treatment, y = Insertions)) + 
+  geom_bar(stat = 'identity', position = 'dodge', color = "black", fill = "grey", alpha = 0.3, show.legend = FALSE) + 
+  geom_errorbar(aes(ymin = Insertions - INSsem, ymax = Insertions + INSsem), position = position_dodge(width = 0.9), width = 0.5) + 
+  geom_point(aes(x = genotype, y = INSnumber, color = "red"), position=position_jitterdodge(jitter.width=0.5), size = 2, show.legend = FALSE ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, face = "bold", hjust = 1 )) -> ins_sum_plot_filt
+
+ggsave(paste0(outDir, "/plots/general_plots/202301_Polpaper_INS_filt_plot.pdf"), ins_sum_plot_filt, width = 5, height = 4.5 )
+
+ins_sum_plot_filt
+```
+
+### Deletion numbers, statistic and plotting
+
+```{r total.number.del}
+ delScore <- cdel[ ,c(setdiff(treatments$starting_clones, problematic), "treshold")] %>% 
+  apply(1, function(x) ifelse(sum(x[1:length(setdiff(treatments$starting_clones, problematic))] < 5) == length(setdiff(treatments$starting_clones, problematic)), x[length(setdiff(treatments$starting_clones, problematic)) + 1], NA)) %>% 
+  min(na.rm = TRUE)
+
+
+del_filt <- filter(del, score > delScore , chr != "MT" , !(grepl(paste(problematic, collapse = "|"), X.sample_name)))
+
+
+del_filt$sample <- sub("_RMdup_IR.bam", "", del_filt$X.sample_name)
+del_filt$sample <- sub("_RMdup.bam", "", del_filt$sample)
+factor(del_filt$sample, levels = sort(unique(snv$sample))) %>% 
+tabulate() %>% 
+barplot(las = 2, names.arg = sort(unique(snv$sample)), ylab = paste0("Number of deletions with score >= ", delScore))
+
+del_filt$genotype <- NA
+for (i in 1:length(genotypes)) {
+  del_filt[which(del_filt$sample %in% genotypes[[i]]), "genotype"] <- names(genotypes)[i]  
+}
+
+del_filt$treatment <- NA
+for (i in 1:length(treatments)) {
+  del_filt[which(del_filt$sample %in% treatments[[i]]), "treatment"] <- names(treatments)[i]  
+}
+
+del_filt$treatment <- factor(del_filt$treatment, levels = names(treatments))
+del_filt$genotype <- factor(del_filt$genotype, levels = names(genotypes))
+
+group_by(del_filt, genotype, treatment, sample) %>%
+  summarize(DELnumber = n()) %>% 
+  as.data.frame() -> del_numbers
+
+write.csv(del_numbers,  paste0(outDir, "/analysis/data_output/_del_numbers.csv"), quote = FALSE, row.names = FALSE)
+
+del_numbers <- filter(del_numbers, treatment == "mock")
+
+for (i in 1:length(gtypes)){
+  gtype = gtypes[i]
+
+  x = del_numbers[del_numbers$genotype == gtype,]$DELnumber
+  y = del_numbers[del_numbers$genotype == "WT_P53",]$DELnumber
+  
+  test <- t.test(x = x, y = y, var.equal = TRUE)
+  print(paste(gtype, test$p.value, sep = " "))
+
+}
+```
+
+```{r}
+
+del_filt %>%
+  #filter(!(grepl("WT_Cas9", genotype))) %>%
+  filter(treatment == "mock") %>%
+  group_by(genotype, treatment, sample) %>%
+  summarize(DELnumber = n()) %>% 
+  as.data.frame() %>%
+  group_by(genotype, treatment) %>%
+  mutate(INSsum = sum(DELnumber), 
+            Deletions = mean(DELnumber), 
+            DELsem = sd(DELnumber) / sqrt(n()), 
+            DELsd = sd(DELnumber),
+            genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) %>% 
+  ggplot(aes(x = genotype, fill = treatment, y = Deletions)) + 
+  geom_bar(stat = 'identity', position = 'dodge', color = "black", fill = "grey", alpha = 0.3, show.legend = FALSE) + 
+  geom_errorbar(aes(ymin = Deletions - DELsem, ymax = Deletions + DELsem), position = position_dodge(width = 0.9), width = 0.5) + 
+  geom_point(aes(x = genotype, y = DELnumber, color = "red"), position=position_jitterdodge(jitter.width=0.5), size = 2, show.legend = FALSE ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, face = "bold", hjust = 1 )) -> del_sum_plot_filt
+
+ggsave(paste0(outDir, "/plots/general_plots/202301_Polpaper_DEL_filt_plot.pdf"),del_sum_plot_filt, width = 5, height = 4.5 )
+
+del_sum_plot_filt
+```
+
+### Length distributions
+
+Length distributions will be saved for each sample analyzed in this run of Isomut separately for insertions and deletions.
+
+```{r indel.lengths}
+with(ins_filt, table(sample, nchar(mut))) %>% write.table(file = paste0(outDir, "/analysis/data_output/_insertion_lengths.csv"), quote = FALSE)
+with(del_filt, table(sample, nchar(ref))) %>% write.table(file = paste0(outDir, "/analysis/data_output/_deletion_lengths.csv"), quote = FALSE)
+
+del_filt$ref <- as.character(del_filt$ref)
+
+filter(del_filt, treatment == "mock") %>%
+  #filter(!(grepl("WT_Cas9", genotype))) %>%
+  mutate(dellength = nchar(ref),
+         genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) %>% 
+  ggplot() + 
+  stat_ecdf(aes(x = log10(dellength), color = genotype)) + 
+  theme_bw() + 
+  xlab("log10 (length of deletion)") + 
+  ylab("Cumulative fraction") + 
+  ggtitle("Cumulative distribution of log10 deletion lengths") -> del_accum_plot_filt
+
+ggsave(paste0(outDir, "/plots/general_plots/202301_Polpaper_del_accum_sum_plot.pdf"), del_accum_plot_filt, width = 6, height = 4 )
+
+```
+
+### Indel contexts
+
+The context files for the indels will contain four-four columns:
+
+* for the deletions: -> 50 to -> 2 bases; -> 1 base; deleted sequence; +1 to +50 bases; ie. the events is as long as the deletion
+* for the insertions: -> 50 to -> 2 bases; -> 1 base; inserted sequence; +1 to +50 bases; ie. the event is 0 bps long
+
+```{r indel.context}
+#ins_filt$chr <- paste0("chr", ins_filt$chr)
+
+with(ins_filt, GRanges(paste0("chr",chr), ranges = IRanges(pos - 50, end = pos + 50))) %>%
+  getSeq(Hsapiens, .) %>%
+  as.character() -> ins_cont
+
+ins_context <- data.frame(Sample = ins_filt$sample, Chr = ins_filt$chr, Pos = ins_filt$pos, Prev50to2 = substr(ins_cont, 1, 50), Prev1 = substr(ins_cont, 51, 51), Inserted = ins_filt$mut, Next50 = substr(ins_cont, 52, 101))
+
+write.table(ins_context, file = paste0(outDir,  "/analysis/data_output/_insertion_context.csv"), quote = FALSE, row.names = FALSE)
+
+with(del_filt, GRanges(paste0("chr",chr), ranges = IRanges(pos + nchar(as.character(ref)) + 1, end = pos + nchar(as.character(ref)) + 50))) %>%
+  getSeq(Hsapiens, .) %>%
+  as.character() -> del_after
+with(del_filt, GRanges(paste0("chr",chr), ranges = IRanges(pos - 50, end = pos))) %>%
+  getSeq(Hsapiens, .) %>%
+  as.character() -> del_before
+
+del_context <- data.frame(Sample = del_filt$sample, Genotype = del_filt$genotype, Treatment = del_filt$treatment, Chr = del_filt$chr, Pos = del_filt$pos, Prev50to2 = substr(del_before, 1, 50), Prev1 = substr(del_before, 51, 51), Deleted = del_filt$ref, Next50 = del_after)
+```
+
+```{r del.categories}
+delClassifier <- function(deleted, upstream) {
+  if (length(deleted) != length(upstream)) {
+    print("Sequence vectors have to be of equal length!")
+  }
+  ret <- vector(length = length(deleted))
+  deleted <- as.character(deleted)
+  upstream <- as.character(upstream)
+  for (i in 1:length(deleted)) {
+    ret[i] <- ifelse(
+      substr(upstream[i], 1, nchar(deleted[i])) == deleted[i],
+      "repeat",
+      ifelse(
+        substr(upstream[i], 1, 1) == substr(deleted[i], 1, 1),
+        "homology",
+        "no homology"
+      )
+    )
+  }
+  return(ret)
+}
+
+del_context$Category <- with(del_context, delClassifier(Deleted, Next50))
+with(del_context, ftable(Category ~ Genotype + Treatment))
+with(del_context, ftable(Category ~ Sample))
+write_csv(del_context, file = paste0(outDir, "/analysis/data_output/_deletion_context.csv"))
+
+filter(del_context, Treatment == "mock") %>% 
+  group_by(Sample, Genotype, Treatment, Category) %>% 
+  summarize(Sum = n()) %>%
+  mutate(Genotype = factor(Genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" )),
+         Xpos = Genotype) %>% 
+  group_by(Xpos, Category) %>% 
+  summarize(Mean = mean(Sum), SEM = sd(Sum) / sqrt(n())) %>% 
+  ggplot(aes(x = gsub(":", "\n", Xpos), y = Mean, fill = Category)) + 
+  geom_bar(stat = 'identity', position = position_dodge()) + 
+  geom_errorbar(aes(ymin = Mean ->  SEM, ymax = Mean + SEM), position = position_dodge(width = 0.9), width = 0.5) + 
+  theme_bw() + xlab("") + ylab("Count") + 
+  ggtitle("Means and SEMs of deletion categories") + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) -> del_context_bar_filt
+
+filter(del_context,  Treatment == "mock") %>% 
+  mutate(Genotype = factor(Genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) %>% 
+  ggplot(aes(x = interaction(Genotype, Treatment), y = nchar(Deleted), group = Category, color = Category)) + 
+  geom_point(position = position_jitterdodge(jitter.width = 0.2, jitter.height = 0.5, dodge.width = 0.7)) + 
+  theme_minimal() + 
+  ylab("Length of deletions") + 
+  xlab("Genotype") + 
+  ggtitle("Categories and lengths together") + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) -> del_context_point_filt
+
+
+ggsave(paste0(outDir, "/plots/general_plots/202301_Polpaper_del_context_bar_filt.pdf"), del_context_bar_filt, width = 10, height = 4 )
+ggsave(paste0(outDir, "/plots/general_plots/202301_Polpaper_del_context_pint_filt.pdf"), del_context_point_filt, width = 10, height = 4 )
+
+```
+
+
+### Plotting large indels from GRIDSS run
+```{r}
+large_del <- read_table(file.path(outDir, "/analysis/data_input/deletion_500_to_5000.txt"))
+  
+large_del %>%
+  group_by(Genotype) %>%
+  mutate(DELmean = mean(N),
+          DELsem = sd(N) / sqrt(n()), 
+          DELsd = sd(N), 
+         Genotype = factor(Genotype, levels = c("control", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) %>%
+  ggplot(aes(x = Genotype, y = DELmean)) + 
+  geom_bar(stat = 'identity', position = 'dodge', color = "black", fill = "grey", alpha = 0.3, show.legend = FALSE) + 
+  geom_errorbar(aes(ymin = DELmean - DELsem, ymax = DELmean + DELsem), position = position_dodge(width = 0.9), width = 0.5) + 
+  geom_point(aes(x = Genotype, y = N, color = "red"), position=position_jitterdodge(jitter.width=0.5), size = 2, show.legend = FALSE ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, face = "bold", hjust = 1 )) -> large_del_plot
+
+ggsave(paste0(outDir, "/plots/general_plots/202301_Polpaper_large_deletions_500_to_5000.pdf"),large_del_plot, width = 5, height = 4.5 )
+  
+gtypes <- c("control","REV1","REV3L","PRIMPOL","K164R","REV1_PRIMPOL","K164R_PRIMPOL","K164R_REV1")
+
+for (i in 1:length(gtypes)){
+  gtype = gtypes[i]
+
+  x = large_del[large_del$Genotype == gtype,]$N
+  y = large_del[large_del$Genotype == "control",]$N
+  
+  test <- t.test(x = x, y = y, var.equal = TRUE)
+  print(paste(gtype, test$p.value, sep = " "))
+
+}
+
+  
+```
+
+### Using getSeq, neighbourhood of SNVs retrieved (required for downstream triplet-spectra analysis)
+```{r}
+revcomp <- function(seq) {
+  df <- data.frame(a = c("A", "C", "G", "T"), b = c("T", "G", "C", "A"))
+  seq = rev(strsplit(seq, split = "")[[1]])
+  ret = c()
+  for (i in seq_along(seq)) {
+    ret[i] = df[which(df$a == seq[i]), "b"]
+  }
+  return(paste0(ret, collapse = ""))
+}
+
+snv_filt %>%
+  with(GRanges(paste0("chr", chr), IRanges(start = pos - 1, end = pos + 1))) %>%
+  getSeq(Hsapiens, .) %>%
+  as.character() -> snv_filt$triplet
+
+snv_filt$sorting <- apply(snv_filt, 1, function(y) paste0(substr(y[15], 1, 1), "[", y[6], ">", y[7], "]", substr(y[15], 3, 3)))
+
+snv_filt$sorting2 <- apply(snv_filt, 1, function(y) ifelse(y[6] %in% c("C", "T"), y[16], paste0(revcomp(substr(y[16], 7, 7)), "[", revcomp(substr(y[16], 3, 3)), ">", revcomp(substr(y[16], 5, 5)), "]", revcomp(substr(y[16], 1, 1))) ))
+
+```
+
+
+# Transcription strand bias
+```{r}
+seqlevelsStyle(BSgenome.Hsapiens.UCSC.hg38) <- "UCSC"
+library(TxDb.Hsapiens.UCSC.hg38.refGene)
+TxDb_Hs108 <- GenomicFeatures::makeTxDbFromGFF(file.path(outDir,"analysis/data_input/Homo_sapiens.GRCh38.108.gtf"))
+seqlevelsStyle(TxDb_Hs108) <- "UCSC"
+
+vcf <- with(snv_filt, GRanges(seqnames = chr, ranges = IRanges(start = pos, end = pos)))
+names(vcf) <- paste0(snv_filt$chr, ":", snv_filt$pos, "_", snv_filt$ref, "/", snv_filt$mut)
+mcols(vcf)$paramRangeID <- factor(NA)
+mcols(vcf)$REF <- DNAStringSet(snv_filt$ref)
+mcols(vcf)$ALT <- DNAStringSet(snv_filt$mut)
+mcols(vcf)$QUAL <- as.numeric(NA)
+mcols(vcf)$FILTER <- "PASS"
+seqlevelsStyle(vcf) <- "UCSC"
+
+# strand from mut_strand is already for the 6 categories, so no need to change
+snv_filt$strand <- as.character(MutationalPatterns::mut_strand(vcf = vcf, ranges = genes(TxDb_Hs108), mode = "transcription"))
+
+```
+
+```{r}
+
+snv_filt %>%
+  dplyr::select(genotype, sample, chr, pos, treatment, strand) %>%
+  mutate(strand = factor(strand, levels = c("transcribed", "-", "untranscribed"))) %>%
+  filter(treatment == "mock") %>%
+  group_by(genotype,sample, strand) %>%
+  summarize(SNVnumber = n()) %>%
+  group_by(genotype, strand) %>%
+  mutate(genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" )),
+         sum = sum(SNVnumber), 
+         mean = mean(SNVnumber), 
+         sem = sd(SNVnumber) / sqrt(n()), 
+         sd = sd(SNVnumber) ) %>%
+  ggplot(aes(x = genotype, y = mean, fill = strand)) + 
+  geom_bar(stat = 'identity', position = "dodge", color = "black", alpha = 0.7) + 
+  geom_errorbar(aes(ymin = mean ->  sem, ymax = mean + sem), position = position_dodge(width = 0.9), width = 0.25) + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, face = "bold", hjust = 1 )) +
+  xlab("Genotype") +
+  ylab("SNV numbers") +
+  ggtitle("SNV numbers by genotypes considering the transcription") -> plot_transcription
+  
+dir.create(paste0(outDir, "/plots/strand_bias_plots/"), recursive = TRUE)
+  
+ggsave(file.path(outDir, "plots/strand_bias_plots/202301_Polpaper_snv_transcript_bias_per_sample.pdf"), plot_transcription, width = 12, height = 6, unit = "in")
+
+snv_filt %>%
+  mutate(strand = factor(strand, levels = c("transcribed", "-", "untranscribed"))) %>%
+  dplyr::select(genotype, sample, chr, pos, treatment, strand) %>%
+  filter(treatment == "mock") %>%
+  group_by(genotype,sample, strand) %>%
+  summarize(SNVnumber = n()) %>%
+  group_by(genotype, strand) %>%
+  mutate(genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" )),
+         sum = sum(SNVnumber), 
+         mean = mean(SNVnumber), 
+         sem = sd(SNVnumber) / sqrt(n()), 
+         sd = sd(SNVnumber)) %>%
+  write.table(., file = paste0(outDir, "/SNV_TSB_per_sample.csv"), row.names = FALSE, quote = FALSE, sep = ",")
+
+
+snv_filt %>%
+  mutate(strand = factor(strand, levels = c("transcribed", "-", "untranscribed"))) %>%
+  dplyr::select(genotype, sample, ref, mut, chr, pos, treatment, strand, sorting2) %>%
+  filter(treatment == "mock") %>%
+  mutate(change = paste0(ref,">" ,mut),
+           change_updated = substr(sorting2,3,5)) %>% 
+  group_by(genotype, change_updated, strand) %>%
+  summarize(SNVnumber = n()) %>%
+  group_by(genotype, change_updated,  strand) %>%
+  mutate(genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) %>%
+  arrange(genotype) %>%
+  filter(strand != "-") -> tmp
+
+write_csv(tmp, file.path(outDir, "analysis/data_output/_transcriptional_bias.csv"))
+
+bchanges <- base::unique(tmp$mutation)
+gtypes = c("WT_P53","REV1","REV3L","PRIMPOL","K164R","REV1_PRIMPOL","K164R_PRIMPOL","K164R_REV1")
+
+
+# binomial statistic 
+stat = c()
+for (i in 1:length(gtypes)){
+  for (j in 1:length(bchanges)){
+    
+    gtype = gtypes[i]
+    bchange = bchanges[j]
+    
+    x = tmp[(tmp$genotype == gtype & tmp$change_updated == bchange),]$SNVnumber
+    
+    test = binom.test(x = x, p = 0.5)
+    
+    if (test$p.value < 0.05) {
+      print(paste(gtype, bchange, test$p.value, "*", sep = " "))
+      stat = c(stat, round(test$p.value,3), round(test$p.value,3))
+    } else {
+      print(paste(gtype, bchange, test$p.value, "ns", sep = " "))
+      stat = c(stat, "ns", "ns")
+    }
+  }
+}
+
+tmp %>% arrange(genotype, change_updated) -> tmp
+tmp$significance = stat
+
+
+# Plotting
+tmp %>%
+    ggplot(aes(x = change_updated, y = SNVnumber, fill = strand)) + 
+    geom_bar(stat = 'identity', position = "dodge", color = "black", alpha = 0.7) + 
+    geom_text(aes(x = change_updated, y = 335, label = significance), size=2, show.legend = FALSE) +
+    ylim(0, 350) +
+    theme_bw() +
+    xlab("Mutation") +
+    ylab("SNV numbers") +
+    facet_wrap(~genotype, ncol = 4) +
+    ggtitle("SNV numbers considering the transcription") + 
+    theme(strip.text.x = element_text(size = 6.5)) +
+    theme(axis.text.x = element_text(angle = 45, face = "bold", hjust = 1 )) -> tmp_plot
+
+ggsave(file.path(outDir, "plots/strand_bias_plots/202301_Polpaper_SNV_TSB_by_change_with_statistic.pdf"), tmp_plot, width = 10, height = 5, unit = "in")
+
+```
+
+
+```{r}
+rfd <- read_csv("~/Documents/PolPaper/202310_polymerase_paper/data_input/HeLa_rfd.csv")
+rfd <- dplyr::select(rfd, -c(C,W)) %>% drop_na()
+rfd$Chr <- factor(rfd$Chr, levels = paste0("chr", c(1:22, "X", "Y")))
+rfd <- arrange(rfd, Chr, Start) %>% drop_na()
+rfd_range <- GRanges(rfd$Chr, ranges = IRanges(rfd$Start, end = rfd$End ->  1), score = rfd$Score)
+
+
+olaps <- findOverlaps(query = vcf, subject = rfd_range)
+snv_filt_repl <- snv_filt[queryHits(olaps), ]
+snv_filt_repl$RFD <- pull(rfd[subjectHits(olaps),"Score"])
+
+
+```
+
+```{r}
+
+snv_filt_repl %>%
+    dplyr::select(genotype, sample, ref, mut, treatment, RFD, sorting2) %>%
+    mutate(change = paste0(ref,">" ,mut),
+           change_updated = substr(sorting2,3,5),
+           genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) %>%
+    mutate(rfd_updated = case_when(change == change_updated ~ RFD, 
+                                   change != change_updated ~ -1*RFD )) %>%
+    filter(treatment == "mock") %>%
+    mutate(replication_strand = ifelse(RFD > 0.2, "leading",
+                                        ifelse( RFD < 0.2, "lagging", "ambivalent"))) %>%
+    mutate(replication_strand_updated = ifelse(rfd_updated > 0.2, "leading",
+                                        ifelse( rfd_updated < 0.2, "lagging", "ambivalent"))) %>%
+    mutate(ref_updated = substr(change_updated, 1,1)) %>%
+    group_by(genotype, ref_updated, sample, replication_strand) %>%
+    summarise(SNVnumber = n()) %>%
+    group_by(genotype, ref_updated, replication_strand) %>%
+    mutate(sum = sum(SNVnumber), 
+           mean = mean(SNVnumber), 
+           sem = sd(SNVnumber) / sqrt(n()), 
+           sd = sd(SNVnumber)) %>%
+    ggplot(aes(x = ref_updated, y = mean, fill = replication_strand)) + 
+    geom_bar(stat = 'identity', position = "dodge", color = "black", alpha = 0.7) + 
+    geom_errorbar(aes(ymin = mean ->  sem, ymax = mean + sem), position = position_dodge(width = 0.9), width = 0.5) + 
+    theme_bw() +
+    xlab("Reference base") +
+    ylab("SNV numbers") +
+    facet_wrap(~genotype, ncol = 4, scales = "free") +
+    ggtitle("SNV numbers by reference base considering the direction of replication") + 
+    theme(strip.text.x = element_text(size = 6.5)) -> tmp
+
+ggsave(file.path(outDir, "plots/strand_bias_plots/202301_Polpaper_SNV_RSB_hela_by_ref.pdf"), tmp, width = 10, height = 5, unit = "in")
+
+
+snv_filt_repl %>%
+    dplyr::select(genotype, sample, ref, mut, treatment, RFD, sorting2) %>%
+    mutate(change = paste0(ref,">" ,mut),
+           change_updated = substr(sorting2,3,5),
+           genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) %>%
+    mutate(rfd_updated = case_when(change == change_updated ~ > RFD, 
+                                   change != change_updated ~  -1*RFD )) %>%
+    filter(treatment == "mock") %>%
+    mutate(replication_strand = ifelse(RFD > 0.2, "leading",
+                                        ifelse( RFD < 0.2, "lagging", "ambivalent"))) %>%
+    mutate(replication_strand_updated = ifelse(rfd_udated > 0.2, "leading",
+                                        ifelse( rfd_updated < 0.2, "lagging", "ambivalent"))) %>%
+    mutate(mut_updated = substr(change_updated, 3,3)) %>%
+    group_by(genotype, mut_updated, sample, replication_strand) %>%
+    summarise(SNVnumber = n()) %>%
+    group_by(genotype, mut_updated, replication_strand) %>%
+    mutate(sum = sum(SNVnumber), 
+           mean = mean(SNVnumber), 
+           sem = sd(SNVnumber) / sqrt(n()), 
+           sd = sd(SNVnumber)) %>%
+    ggplot(aes(x = mut_updated, y = mean, fill = replication_strand)) + 
+    geom_bar(stat = 'identity', position = "dodge", color = "black", alpha = 0.7) + 
+    geom_errorbar(aes(ymin = mean ->  sem, ymax = mean + sem), position = position_dodge(width = 0.9), width = 0.5) + 
+    theme_bw() +
+    xlab("Incorporated base") +
+    ylab("SNV numbers") +
+    facet_wrap(~genotype, ncol = 4, scales = "free") +
+    ggtitle("SNV numbers by incorporated base considering the direction of replication") + 
+    theme(strip.text.x = element_text(size = 6.5)) -> tmp
+
+ggsave(file.path(outDir, "plots/strand_bias_plots/202301_Polpaper_SNV_RSB_hela_by_mut.pdf"), tmp, width = 10, height = 5, unit = "in")
+
+
+snv_filt %>%
+  filter(treatment == "mock") %>%
+  mutate(mutation = substr(sorting2, 3,5),
+         strand = factor(strand, levels = c("untranscribed", "-", "transcribed")),
+         genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) %>%
+  group_by(genotype, sample, strand, mutation) %>%
+  summarize(SNVnumber = n()) %>%
+  group_by(genotype, strand, mutation) %>%
+  mutate(sum = sum(SNVnumber), 
+           mean = mean(SNVnumber), 
+           sem = sd(SNVnumber) / sqrt(n()), 
+           sd = sd(SNVnumber)) %>%
+  ggplot(aes(x = mutation, y = mean, fill = strand)) + 
+    geom_bar(stat = 'identity', position = "dodge", color = "black", alpha = 0.7) + 
+    geom_errorbar(aes(ymin = mean ->  sem, ymax = mean + sem), position = position_dodge(width = 0.9), width = 0.5) + 
+    theme_bw() +
+    xlab("Mutation") +
+    ylab("SNV numbers") +
+    facet_wrap(~genotype, ncol = 4) +
+    ggtitle("SNV numbers by incorporated base considering the direction of replication") + 
+    theme(strip.text.x = element_text(size = 8),
+          axis.text.x = element_text(angle = 45))
+
+
+snv_filt_repl %>%
+  filter(treatment == "mock" & !(is.na(RFD))) %>%
+  mutate( color = case_when(RFD >= 0.2 ~ "blue",
+                           RFD <=  0.2 ~ "red",
+                           RFD > 0.2 & RFD < 0.2 ~ "green")) %>%
+  ggplot() +
+  geom_histogram(aes(x = RFD, fill = color), bins = 105, show.legend = FALSE) +
+  geom_vline(xintercept = -0.2, linetype = 2) +
+  geom_vline(xintercept = 0.2, linetype = 2) +
+  theme_bw()  -> RFD_hist
+
+ggsave(file.path(outDir, "plots/strand_bias_plots/202301_Polpaper_RFD_histogram_hela.pdf"), RFD_hist, width = 8, height = 6, unit = "in")
+
+```
+
+
+```{r}
+rpe1 <- read.table("~/Downloads/GSM3130725_REP1_rpe_edu.txt", header = TRUE)
+rpe2 <- read.table("~/Downloads/GSM3130726_REP2_rpe_edu.txt", header = TRUE)
+
+rpe_ok <- data.frame("chr" =  rpe1$chr, 
+                     "start" = rpe1$pos -> 100,
+                     "end" = rpe1$pos,
+                     "w1" = rpe1$w,
+                     "c1" = rpe1$c,
+                     "w2" = rpe2$w,
+                     "c2" = rpe2$c)
+
+rpe_ok %>%
+  mutate(rfd1 = (c1-w1)/(c1+w1),
+         rfd2 = (c2-w2)/(c2+w2)) -> rpe_ok
+
+slideFunctMean <- function(data, window, step){
+  total <- length(data)
+  spots <- seq(from=1, to=(total), by=step)
+  result <- vector(length = length(spots))
+  
+  for(i in 1:length(spots)){
+    result[i] <- mean(data[spots[i]:(spots[i]+window)], na.rm = TRUE )
+  }
+  return(result)
+}
+
+slideFunctSum <- function(data, window, step){
+  total <- length(data)
+  spots <- seq(from=1, to=(total), by=step)
+  result <- vector(length = length(spots))
+  
+  for(i in 1:length(spots)){
+    result[i] <- sum(data[spots[i]:(spots[i]+window)], na.rm = TRUE )
+  }
+  return(result)
+}
+
+fragGen <- function(length, window){
+  
+  start <- rep(0, round(length/window))
+  end <- rep(0, round(length/window))
+  
+  for (i in 0:length(start)){
+    start[i+1] = window*i
+    }
+  
+  
+  for (i in 1:length(end)){
+    end[i] = (window*i)+1
+    }
+    return(list(start,end))
+}
+
+
+lapply(1:22, function (x) slideFunctMean(rpe_ok[rpe_ok$chr == x,]$rfd1, 50, 1)) -> chr_rfd1 
+lapply(1:22, function (x) slideFunctMean(rpe_ok[rpe_ok$chr == x,]$rfd2, 50, 1)) -> chr_rfd2
+
+rpe_ok$rfd_slide1 <- base::unlist(chr_rfd1)
+rpe_ok$rfd_slide2 <- base::unlist(chr_rfd2)
+
+rpe_ok %>%
+  rowwise() %>%
+  mutate(RFD = mean(c(rfd_slide1, rfd_slide2), na.rm= TRUE),
+         chr = paste0("chr", chr)) %>%
+  ungroup() -> rpe_ok_2
+
+rpe_ok_2 %>%
+  filter(!is.na(rfd_slide1) & !is.na(rfd_slide2)) -> rpe_ok_2
+
+write.table(rpe_ok_2, file = paste0(outDir, "/analysis/data_output/RPE1_RFD.csv"), row.names = FALSE, quote = FALSE, sep = ",")
+
+normalizeGenomicPositions <- function(chr, pos) {
+  pos <- as.numeric(pos)
+  whichChrom <- which(seqNames %in% chr)
+  earlierChromsLength <- sum(seqLengths[0:(whichChrom - 1)])
+  return(as.numeric(earlierChromsLength) + pos)
+}
+
+
+rpe_ok_2$normPos <- apply(rpe_ok_2, 1, function(x) normalizeGenomicPositions(x[1], x[2]))
+
+fn_interpolate <- approxfun(rpe_ok_2$normPos, rpe_ok_2$RFD, method = "linear")
+
+snv_filt$normPos <- apply(snv_filt, 1, function(x) normalizeGenomicPositions(paste0("chr", x[2]), x[3]))
+
+snv_filt$RFD<- fn_interpolate(snv_filt$normPos)
+
+```
+
+
+```{r}
+
+snv_filt %>%
+  filter(!is.na(RFD)) %>%
+  dplyr::select(genotype, sample, ref, mut, treatment, RFD, sorting2) %>%
+  mutate(change = paste0(ref,">" ,mut),
+         change_updated = substr(sorting2,3,5),
+         genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) %>%
+  mutate(rfd_updated = case_when(change == change_updated ~ RFD, 
+                                 change != change_updated ~ -1*RFD )) %>%
+  filter(treatment == "mock") %>%
+  mutate(replication_strand_updated = ifelse(rfd_updated > 0.2, "leading",
+                                             ifelse(rfd_updated < -0.2, "lagging", "ambivalent"))) %>%
+  group_by(genotype, sample, replication_strand_updated) %>%
+  summarise(SNVnumber = n()) %>%
+  group_by(genotype, replication_strand_updated) %>%
+  mutate(sum = sum(SNVnumber), 
+         mean = mean(SNVnumber), 
+         sem = sd(SNVnumber) / sqrt(n()), 
+         sd = sd(SNVnumber)) %>%
+  ggplot(aes(x = genotype, y = mean, fill = replication_strand_updated)) + 
+  geom_bar(stat = 'identity', position = "dodge", color = "black", alpha = 0.7) + 
+  geom_errorbar(aes(ymin = mean ->  sem, ymax = mean + sem), position = position_dodge(width = 0.9), width = 0.25) + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, face = "bold", hjust = 1 )) +
+  xlab("Genotype") +
+  ylab("SNV numbers") +
+  ggtitle("SNV numbers by genotypes considering the replication direction") -> plot_RSB
+  
+  
+ggsave(file.path(outDir, "plots/strand_bias_plots/202301_Polpaper_snv_RSB_rpe1_per_sample.pdf"), plot_RSB, width = 12, height = 6, unit = "in")
+
+
+snv_filt %>%
+  filter(treatment == "mock" & !(is.na(RFD))) %>%
+  mutate(mutation = substr(sorting2, 3,5),
+         change = paste0(ref,">" ,mut),
+         change_updated = substr(sorting2,3,5),
+         genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) %>%
+  mutate(rfd_updated = case_when(change == change_updated ~ RFD, 
+                                   change != change_updated ~ -1*RFD )) %>%
+  mutate(replication_strand = ifelse(RFD > 0.2, "leading",
+                                        ifelse( RFD < -0.2, "lagging", "ambivalent"))) %>%
+  mutate(replication_strand_updated = ifelse(rfd_updated > 0.2, "leading",
+                                        ifelse( rfd_updated < -0.2, "lagging", "ambivalent"))) %>%
+  mutate(replication_strand_updated = factor(replication_strand_updated, 
+                                             levels = c("lagging","ambivalent", "leading" ))) %>%
+  group_by(genotype, sample, replication_strand_updated, mutation) %>%
+  summarize(SNVnumber = n()) %>%
+  group_by(genotype, replication_strand_updated, mutation) %>%
+  mutate(sum = sum(SNVnumber), 
+           mean = mean(SNVnumber), 
+           sem = sd(SNVnumber) / sqrt(n()), 
+           sd = sd(SNVnumber))  %>%
+  ggplot(aes(x = mutation, y = mean, fill = replication_strand_updated)) + 
+    geom_bar(stat = 'identity', position = "dodge", color = "black", alpha = 0.7) + 
+    geom_errorbar(aes(ymin = mean ->  sem, ymax = mean + sem), position = position_dodge(width = 0.9), width = 0.5) + 
+    theme_bw() +
+    xlab("Mutation") +
+    ylab("SNV numbers") +
+    facet_wrap(~genotype, ncol = 2) +
+    ggtitle("SNV numbers by incorporated base considering the direction of replication") + 
+    theme(strip.text.x = element_text(size = 8),
+          axis.text.x = element_text(angle = 45)) -> tmp_plot
+
+ggsave(file.path(outDir, "plots/strand_bias_plots/202301_Polpaper_SNV_RSB_rpe1_by_change.pdf"), tmp_plot, width = 12, height = 6, unit = "in")
+
+snv_filt %>%
+  filter(treatment == "mock" & !(is.na(RFD))) %>%
+  mutate(mutation = substr(sorting2, 3,5),
+         change = paste0(ref,">" ,mut),
+         change_updated = substr(sorting2,3,5),
+         genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) %>%
+  mutate(rfd_updated = case_when(change == change_updated ~ RFD, 
+                                   change != change_updated ~ -1*RFD )) %>%
+  mutate(replication_strand = ifelse(RFD > 0.2, "leading",
+                                        ifelse( RFD < -0.2, "lagging", "ambivalent"))) %>%
+  mutate(replication_strand_updated = ifelse(rfd_updated > 0.2, "leading",
+                                        ifelse( rfd_updated < -0.2, "lagging", "ambivalent"))) %>%
+  mutate(replication_strand_updated = factor(replication_strand_updated, 
+                                             levels = c("lagging","ambivalent", "leading" ))) %>%
+  group_by(genotype, replication_strand_updated, mutation) %>%
+  summarize(SNVnumber = n()) -> tmp
+
+
+
+tmp <- filter(tmp, replication_strand_updated != "ambivalent" )
+
+bchanges <- base::unique(tmp$mutation)
+gtypes = c("WT_P53","REV1","REV3L","PRIMPOL","K164R","REV1_PRIMPOL","K164R_PRIMPOL","K164R_REV1")
+
+stat = c()
+for (i in 1:length(gtypes)){
+  for (j in 1:length(bchanges)){
+    
+    gtype = gtypes[i]
+    bchange = bchanges[j]
+    
+    x = tmp[(tmp$genotype == gtype & tmp$mutation == bchange),]$SNVnumber
+    
+    test = binom.test(x = x, p = 0.5)
+    
+    if (test$p.value < 0.05) {
+      print(paste(gtype, bchange, test$p.value, "*", sep = " "))
+      stat = c(stat, test$p.value, test$p.value)
+    } else {
+      print(paste(gtype, bchange, test$p.value, "ns", sep = " "))
+      stat = c(stat, "ns", "ns")
+    }
+  }
+}
+
+tmp %>% arrange(genotype, mutation) -> tmp
+tmp$significance = stat
+
+tmp %>%
+  ggplot(aes(x = mutation, y = SNVnumber, fill = replication_strand_updated)) + 
+    geom_bar(stat = 'identity', position = "dodge", color = "black", alpha = 0.7) + 
+    geom_text(aes(label = significance, y = 325)) +
+    ylim(0, 350) +
+    theme_bw() +
+    xlab("Mutation") +
+    ylab("SNV numbers") +
+    facet_wrap(~genotype, ncol = 4) +
+    ggtitle("SNV numbers by incorporated base considering the direction of replication") + 
+    theme(strip.text.x = element_text(size = 8),
+          axis.text.x = element_text(angle = 45)) #-> tmp_plot
+
+ggsave(file.path(outDir, "plots/strand_bias_plots/202301_Polpaper_SNV_RSB_rpe1_by_change_2.pdf"), tmp_plot, width = 12, height = 6, unit = "in")
+
+snv_filt %>%
+  filter(treatment == "mock" & !(is.na(RFD))) %>%
+  mutate( color = case_when(RFD >= 0.2 ~ "blue",
+                           RFD <= -0.2 ~ "red",
+                           RFD -> 0.2 & RFD < 0.2 ~ "green")) %>%
+  ggplot() +
+  geom_histogram(aes(x = RFD, fill = color), bins = 105, show.legend = FALSE) +
+  geom_vline(xintercept = -0.2, linetype = 2) +
+  geom_vline(xintercept = 0.2, linetype = 2) +
+  theme_bw()  -> RFD_hist
+
+ggsave(file.path(outDir, "plots/strand_bias_plots/202301_Polpaper_RFD_histogram.pdf"), RFD_hist, width = 8, height = 6, unit = "in")
+```
+
+### Plotting Replication strand bias
+```{r}
+rsb <- read_table(file.path(outDir, "analysis/data_input/rsb_stat_all_genotype.tsv"))
+
+rsb %>%
+  mutate(Genotype = factor(Genotype, levels = c("control", "REV1", "REV3L", "PRIMPOL", "K164R",
+                                               "REV1_PRIMPOL", "K164R_PRIMPOL", "K164R_REV1")),
+         significance = ifelse(binomial > 0.05, "ns", round(binomial,3))) -> rsb
+
+
+rsb %>%
+  gather(key = "strand", value = "SNVnumber", -c(Genotype, Mutation, binomial, significance)) %>%
+  ggplot(aes(x = Mutation, y = SNVnumber, fill = strand)) + 
+    geom_bar(stat = 'identity', position = "dodge", color = "black", alpha = 0.7) + 
+    geom_text(aes(x = Mutation, y = 650, label = significance), size=2, show.legend = FALSE) +
+    theme_bw() +
+    xlab("Mutation") +
+    ylab("SNV numbers") +
+    ylim(0, 675) +
+    facet_wrap(~Genotype, ncol = 4) +
+    ggtitle("SNV numbers by incorporated base considering the direction of replication") + 
+    theme(strip.text.x = element_text(size = 8),
+          axis.text.x = element_text(angle = 45)) -> tmp_plot
+
+ggsave(file.path(outDir, "plots/strand_bias_plots/202301_Polpaper_SNV_RSB_rpe1_by_change_2.pdf"), tmp_plot, width = 12, height = 6, unit = "in")
+
+```
+
+### Modification of plot_cosine_heatmap function from MutationalPatterns package to make it suitable for visualization of smaller difference ranges
+```{r}
+plot_cosine_heatmap2 <- function(cos_sim_matrix, col_order = NA, row_order = NA, cluster_rows = TRUE,
+                                cluster_cols = FALSE, method = "complete", plot_values = FALSE, min = 0) {
+  # check explained argument
+  if (!inherits(cos_sim_matrix, "matrix")) {
+    stop("cos_sim_matrix must be a matrix")
+  }
+  # matrix should have row and colnames
+  if (length(colnames(cos_sim_matrix)) == 0) {
+    stop("cos_sim_matrix is missing colnames")
+  }
+  if (length(rownames(cos_sim_matrix)) == 0) {
+    stop("cos_sim_matrix is missing rownames")
+  }
+
+  # These variables use non standard evaluation.
+  # To avoid R CMD check complaints we initialize them to NULL.
+  Cosine.sim <- Signature <- Sample <- x <- y <- xend <- yend <- NULL
+
+  # If cluster_rows is TRUE perform clustering. Else use supplied row_order or
+  # the current column order.
+  if (!is_NA(row_order) & cluster_rows == TRUE) {
+    stop("row_order can only be provided when cluster_rows is FALSE", call. = FALSE)
+  } else if (!is_NA(row_order)) {
+    # check row_order argument
+    if (!inherits(row_order, "character")) {
+      stop("row_order must be a character vector", call. = FALSE)
+    }
+    if (length(row_order) != nrow(cos_sim_matrix)) {
+      stop("row_order must have the same length as the number of
+          samples in the explained matrix", call. = FALSE)
+    }
+  } else if (cluster_rows == TRUE) {
+    # cluster samples based on euclidean distance between relative contribution
+    hc.sample <- hclust(dist(cos_sim_matrix), method = method)
+    # order samples according to clustering
+    row_order <- rownames(cos_sim_matrix)[hc.sample$order]
+
+    dhc <- as.dendrogram(hc.sample)
+    # rectangular lines
+    ddata <- ggdendro::dendro_data(dhc, type = "rectangle")
+    # plot dendrogram of hierachical clustering
+    dendrogram_rows <- ggplot(ggdendro::segment(ddata)) +
+      geom_segment(aes(x = x, y = y, xend = xend, yend = yend)) +
+      coord_flip() +
+      scale_y_reverse(expand = c(0.2, 0)) +
+      ggdendro::theme_dendro()
+  }
+  else {
+    row_order <- rownames(cos_sim_matrix)
+  }
+
+
+  # If cluster_cols is TRUE perform clustering. Else use supplied col_order or
+  # the current column order.
+  if (!is_NA(col_order) & cluster_cols == TRUE) {
+    stop("col_order can only be provided when cluster_cols is FALSE", call. = FALSE)
+  } else if (!is_NA(col_order)) {
+    # check col_order argument
+    if (!inherits(col_order, "character")) {
+      stop("col_order must be a character vector", call. = FALSE)
+    }
+    if (length(col_order) != ncol(cos_sim_matrix)) {
+      stop("col_order must have the same length as the number of 
+          signatures in the explained matrix", call. = FALSE)
+    }
+  } else if (cluster_cols == TRUE) {
+    # Cluster cols
+    hc.sample2 <- cos_sim_matrix %>%
+      t() %>%
+      dist() %>%
+      hclust(method = method)
+    col_order <- colnames(cos_sim_matrix)[hc.sample2$order]
+
+    dhc <- as.dendrogram(hc.sample2)
+    # rectangular lines
+    ddata <- ggdendro::dendro_data(dhc, type = "rectangle")
+    # plot dendrogram of hierachical clustering
+    dendrogram_cols <- ggplot(ggdendro::segment(ddata)) +
+      geom_segment(aes(x = x, y = y, xend = xend, yend = yend)) +
+      ggdendro::theme_dendro() +
+      scale_y_continuous(expand = c(0.2, 0))
+  } else {
+    col_order <- colnames(cos_sim_matrix)
+  }
+
+
+  # Make matrix long and set factor levels, to get the correct order for plotting.
+  cos_sim_matrix.m <- cos_sim_matrix %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("Sample") %>%
+    tidyr::pivot_longer(-Sample, names_to = "Signature", values_to = "Cosine.sim") %>%
+    dplyr::mutate(
+      Signature = factor(Signature, levels = col_order),
+      Sample = factor(Sample, levels = row_order)
+    )
+
+  # plot heatmap
+  heatmap <- ggplot(cos_sim_matrix.m, aes(x = Signature, y = Sample, fill = Cosine.sim, order = Sample)) +
+    geom_raster() +
+    scale_fill_distiller(palette = "YlGnBu", direction = 1, name = "Cosine \nsimilarity", limits = c(min, 1.000000001)) +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()
+    ) +
+    labs(x = NULL, y = NULL)
+
+  # if plot_values is TRUE, add values to heatmap
+  if (plot_values == TRUE) {
+    heatmap <- heatmap + geom_text(aes(label = round(Cosine.sim, 2)), size = 2)
+  }
+
+  # Add dendrogram depending on the clustering of the rows and the columns.
+  if (cluster_rows == TRUE & cluster_cols == TRUE) {
+    empty_fig <- ggplot() +
+      theme_void()
+    plot_final <- cowplot::plot_grid(empty_fig, dendrogram_cols, dendrogram_rows, heatmap,
+      align = "hv", axis = "tblr", rel_widths = c(0.3, 1), rel_heights = c(0.3, 1)
+    )
+  }
+  else if (cluster_rows == TRUE & cluster_cols == FALSE) {
+    # combine plots
+    plot_final <- cowplot::plot_grid(dendrogram_rows, heatmap, align = "h", rel_widths = c(0.3, 1))
+  } else if (cluster_rows == FALSE & cluster_cols == TRUE) {
+    plot_final <- cowplot::plot_grid(dendrogram_cols, heatmap, align = "v", rel_heights = c(0.3, 1)) +
+      # reverse order of the samples such that first is up
+      ylim(rev(levels(factor(cos_sim_matrix.m$Sample))))
+  } else {
+    plot_final <- heatmap +
+      # reverse order of the samples such that first is up
+      ylim(rev(levels(factor(cos_sim_matrix.m$Sample))))
+  }
+
+  return(plot_final)
+}
+```
+
+
+### Longer inserions were quite rare in our sample, thus plotter function provided by MutationalPatterns produced plot with big empty places in them. To make more compact plot, we adjusted count_indel_contexts function.
+```{r}
+
+INDEL_CATEGORIES <- tibble::tibble(
+  "muttype" = c(
+    rep("C_deletion", 6), rep("T_deletion", 6), rep("C_insertion", 6),
+    rep("T_insertion", 6), rep("2bp_deletion", 6), rep("3bp_deletion", 6),
+    rep("4bp_deletion", 6), rep("5+bp_deletion", 6), rep("2+bp_insertion", 6),
+    rep("2bp_deletion_with_microhomology", 1), rep("3bp_deletion_with_microhomology", 2),
+    rep("4bp_deletion_with_microhomology", 3), rep("5+bp_deletion_with_microhomology", 5)
+  ),
+  "muttype_sub" = c(
+    rep(c(seq_len(5), "6+"), 2),
+    rep(c(0:4, "5+"), 2),
+    rep(c(seq_len(5), "6+"), 1),
+    rep(c(0:4, "5+"), 4), 1, 1, 2, 1, 2, 3, 1, 2, 3, 4, "5+"
+  )
+)
+
+count_indel_contexts_2 <- function(vcf_list) {
+
+  # These variables use non standard evaluation.
+  # To avoid R CMD check complaints we initialize them to NULL.
+  muttype <- muttype_sub <- NULL
+
+  categories <- INDEL_CATEGORIES
+  print(categories)
+
+  # Turn grl into list if needed.
+  if (inherits(vcf_list, "CompressedGRangesList")) {
+    vcf_list <- as.list(vcf_list)
+  }
+
+  # Count contexts per sample
+  if (inherits(vcf_list, "list")) {
+    counts_l <- purrr::map(vcf_list, .count_indel_contexts_gr, categories)
+    counts_l
+    counts <- do.call(cbind, counts_l)
+    colnames(counts) <- names(vcf_list)
+  } else if (inherits(vcf_list, "GRanges")) {
+    counts <- .count_indel_contexts_gr(vcf_list, categories)
+    colnames(counts) <- "My_sample"
+    print(counts)
+  } else {
+    .not_gr_or_grl(vcf_list)
+  }
+  counts <- cbind(categories, counts)
+  counts[is.na(counts)] <- 0
+  counts <- counts %>%
+    tidyr::unite("muttype_total", muttype, muttype_sub) %>%
+    tibble::column_to_rownames("muttype_total") %>%
+    as.matrix()
+
+  # counts = dplyr::as_tibble(counts)
+  # counts$muttype = factor(counts$muttype, levels = unique(counts$muttype))
+  return(counts)
+}
+
+#' Count indel contexts from a single GRanges object.
+#'
+#' @details
+#' Counts the number of indels per COSMIC context from a GRanges object containing indel mutations.
+#' The function is called by count_indel_contexts
+#'
+#' @param gr GRanges object containing indel mutations in which the context was added with get_indel_context.
+#' @param categories A tibble containing all possible indel context categories
+#'
+#' @return A single column tibble containing the number of indels per COSMIC context.
+#'
+#' @importFrom magrittr %>%
+#' @noRd
+#'
+.count_indel_contexts_gr <- function(gr, categories) {
+  # These variables use non standard evaluation.
+  # To avoid R CMD check complaints we initialize them to NULL.
+  muttype <- muttype_sub <- NULL
+
+  # Check gr is not empty
+  if (length(gr) == 0) {
+    categories <- categories %>%
+      dplyr::mutate(count = 0) %>%
+      dplyr::select(-muttype, -muttype_sub)
+    return(categories)
+  }
+
+  # Check context has previously been set.
+  gr_colnames <- colnames(mcols(gr))
+  if (!all(c("muttype", "muttype_sub") %in% gr_colnames)) {
+    stop("The GRanges object does not contain the columns `muttype`` and `muttype_sub`.
+             Did you forget to run `get_indel_context`?", call. = FALSE)
+  }
+
+
+  # Classify the number of repeat units/ homopolymer length / microhomology length
+  # to either 5+ or 6+ depending on whether the indel is a ins or del.
+  id_context <- dplyr::tibble("muttype" = gr$muttype, "muttype_sub" = gr$muttype_sub) %>%
+    dplyr::mutate(
+      muttype_sub = ifelse(muttype_sub >= 6, "6+", muttype_sub),
+      muttype_sub = ifelse(grepl("insertion|microhomology", muttype) & muttype_sub >= 5,
+        "5+", muttype_sub
+      ),
+      muttype_sub = as.character(muttype_sub)
+    ) # Ensures column type for later joining
+
+  # Classify large indels as size 5+
+  id_context$muttype = .set_large_indels_as_5plus(id_context$muttype, gr)
+  
+  id_context_count <- id_context %>%
+    dplyr::group_by(muttype, muttype_sub) %>%
+    dplyr::summarise(count = dplyr::n())
+  id_context_count_full <- dplyr::left_join(categories,
+    id_context_count,
+    by = c("muttype", "muttype_sub")
+  ) %>%
+    dplyr::select(-muttype, -muttype_sub)
+  # colnames(id_context_count_full)[3] = name
+  return(id_context_count_full)
+}
+
+
+#' Classify large indels as size 5+
+#' Indels with a size that is more or equal to 5,
+#' are set to size 5+
+#'
+#' @param muttype A vector containing the contexts of the mutations
+#' @param gr GRanges object containing indel mutations in which the context was added with get_indel_context.
+#'
+#' @return A modified version of the vector containing the contexts of the mutations
+#' 
+#' @importFrom magrittr %>%
+#' @noRd
+.set_large_indels_as_5plus = function(muttype, gr){
+  
+  # Determine mutation sizes
+  ref_sizes <- gr %>%
+    .get_ref() %>%
+    width()
+  alt_sizes <- gr %>%
+    .get_alt() %>%
+    unlist() %>%
+    width()
+  mut_size <- abs(alt_sizes - ref_sizes)
+  
+  # Change classification of large mutations into 5+
+  mut_size_f1 <- mut_size >= 2
+  mut_size_f2 <- mut_size >= 5
+  # mut_size_f <- mut_size >= 5
+  # muttype <- ifelse(mut_size_f,
+  #                              gsub("[0-9]+bp",
+  #                                   "5+bp",
+  #                                   muttype,
+  #                                   perl = TRUE
+  #                              ),
+  #                              muttype
+  # )
+  
+  muttype <- ifelse(grepl("[0-9]+bp_insertion", muttype) & mut_size_f1,
+                               gsub("[0-9]+bp",
+                                    "2+bp",
+                                    muttype,
+                                    perl = TRUE
+                               ),
+                               muttype)
+
+  muttype <- ifelse(grepl("[0-9]+bp_deletion", muttype) & mut_size_f2,
+                               gsub("[0-9]+bp",
+                                    "5+bp",
+                                    muttype,
+                                    perl = TRUE
+                               ),
+                               muttype
+                   )
+  return(muttype)
+}
+
+.get_ref <- function(gr) {
+  gr_cols <- colnames(S4Vectors::mcols(gr))
+  if ("REF" %in% gr_cols) {
+    ref <- gr$REF
+  } else if ("ref" %in% gr_cols) {
+    ref <- gr$ref
+  } else if ("Ref" %in% gr_cols) {
+    ref <- gr$Ref
+  } else {
+    stop("Some of your data is missing a REF column.", call. = FALSE)
+    ref <- Biostrings::DNAStringSet()
+  }
+  return(ref)
+}
+
+.get_alt <- function(gr) {
+  gr_cols <- colnames(S4Vectors::mcols(gr))
+  if ("ALT" %in% gr_cols) {
+    alt <- gr$ALT
+  } else if ("alt" %in% gr_cols) {
+    alt <- gr$alt
+  } else if ("Alt" %in% gr_cols) {
+    alt <- gr$Alt
+  } else {
+    stop("Some of your data is missing a ALT column.", call. = FALSE)
+    alt <- Biostrings::DNAStringSetList()
+  }
+  return(alt)
+}
+```
+
+
+### Adjusting form of our data suitable for MutationalPatterns build-in function, followed by processing and plotting indel patterns.
+```{r}
+#indel_filt <- rbind(del_filt, ins_filt)
+
+del_filt %>%
+  rowwise() %>%
+  mutate(start = pos,
+         end = pos + nchar(ref) ) %>%
+  with(., GRanges(paste0("chr",chr), IRanges(start = start, end = end ))) %>%
+    getSeq(Hsapiens, .) %>%
+    as.character() -> del_filt$REF
+
+del_filt %>%
+  rowwise() %>%
+  mutate(start = pos,
+         end = pos ) %>%
+  with(., GRanges(paste0("chr",chr), IRanges(start = start, end = end ))) %>%
+    getSeq(Hsapiens, .) %>%
+    as.character() -> del_filt$ALT
+
+ins_filt %>%
+  rowwise() %>%
+  mutate(start = pos,
+         end = pos ) %>%
+  with(., GRanges(paste0("chr",chr), IRanges(start = start, end = end ))) %>%
+    getSeq(Hsapiens, .) %>%
+    as.character() -> ins_filt$REF
+
+ins_filt %>%
+  rowwise() %>%
+  mutate(ALT = paste0(REF, mut),
+         start = pos,
+         end = pos) %>%
+  ungroup() -> ins_filt
+
+del_filt %>%
+  rowwise() %>%
+  mutate(start = pos,
+         end = pos + nchar(ref)) %>%
+  ungroup() -> del_filt
+  
+indels_filt <- rbind(del_filt, ins_filt) 
+
+dplyr::filter(indels_filt, treatment == "mock") -> indels_filt
+
+
+seqinfo = Seqinfo(paste0("chr",c(1:22, "X")), genome = "hg38")
+
+
+genotypes <- c("WT_P53", "REV1", "REV3L", 
+                "PRIMPOL","K164R", "REV1_PRIMPOL",
+                 "K164R_PRIMPOL", "K164R_REV1")
+
+ref_genome <- "BSgenome.Hsapiens.UCSC.hg38"
+#library(ref_genome, character.only = TRUE)
+
+indel_grl = c()
+for (i in 1:length(genotypes)){
+  genotype = genotypes[i]
+  print(genotype)
+  tmp_df = indels_filt[indels_filt$genotype == genotype,]
+
+  with(tmp_df, GRanges(seqinfo = seqinfo,
+                  paste0("chr",chr),
+                  IRanges(start = start, end = end ),
+                  ALT = ALT, 
+                  REF = REF)) -> tmp_grl
+  
+  tmp_grl <- get_indel_context(tmp_grl, ref_genome)
+  #tmp_grl$muttype <- str_replace(tmp_grl$muttype, regex(paste(paste0(1:200, "bp_insertion"), collapse = "|")), "2+bp_insertion")
+  
+  #print(tmp_grl)
+  
+  indel_grl = c(indel_grl, tmp_grl)
+  }
+
+names(indel_grl) = genotypes
+
+indel_counts <- count_indel_contexts(indel_grl)
+
+indel_count_save <- as.data.frame(indel_counts)
+indel_count_save$categories <- rownames(indel_counts)
+
+write_csv(indel_count_save, file.path(outDir, "analysis/data_output/_indel_context.csv"))
+
+plot_indel_contexts(indel_counts, same_y = TRUE, condensed = TRUE) -> indel_context_plot
+
+dir.create(paste0(outDir, "/plots/MutPat_plots/"), recursive = TRUE)
+
+ggsave(file.path(outDir, "plots/MutPat_plots/202301_Polpaper_indel_cat_MutSig.pdf"), indel_context_plot, width = 18, height = 15, unit = "in")
+
+plot_main_indel_contexts(indel_counts, same_y = TRUE) -> indel_context_plot_main
+
+ggsave(file.path(outDir, "plots/MutPat_plots/202301_Polpaper_indel_cat_MutSig_main.pdf"), indel_context_plot_main, width = 18, height = 15, unit = "in")
+
+plot_cosine_heatmap2(cos_sim_matrix(indel_counts, indel_counts), cluster_cols = TRUE, plot_values = TRUE) ->  indel_heatmap
+
+ggsave(file.path(outDir, "plots/MutPat_plots/202301_Polpaper_indel_cat_heatmap_compressed.pdf"), indel_heatmap, width = 8, height = 5, unit = "in")
+
+cos_sim_matrix(indel_counts, indel_counts) -> indel_cat_cossimm
+
+as.data.frame(indel_cat_cossimm) -> indel_cat_cossimm
+
+indel_cat_cossimm$genotype <- rownames(indel_cat_cossimm)
+
+write_csv(indel_cat_cossimm, file.path(outDir, "analysis/data_output/_indel_cossim.csv"))
+```
+
+### Decomposition of indels patterns with published COSMIC 3.3 indel signatures
+```{r}
+ids <- read_table(file.path(outDir, "analysis/data_input/COSMIC_v3.3_ID_GRCh37.txt"))
+rownames(ids) <- ids$Type
+ids = as.matrix(ids[,2:19])
+
+indel_counts_2 <- indel_counts - indel_counts[,1]
+
+strict_refit <- fit_to_signatures_strict(mut_matrix = indel_counts, 
+                                         signatures = as.matrix(ids))
+fit_res_strict <- strict_refit$fit_res
+plot_contribution(fit_res_strict$contribution,
+  coord_flip = TRUE, mode = "absolute") -> indel_plot
+  
+ggsave(file.path(outDir, paste0("/plots/NMF_plots/202301_Polpaper_decomp_indel.pdf")), indel_plot, width = 9, height = 6)
+
+plot_cosine_heatmap(cos_sim_matrix(indel_counts, as.matrix(ids)))
+```
+
+
+### Making mutation_matrix, input of Non-negative Matrix Factorization (NMF)
+### Columns: sample
+### Rows: triplets
+### Fields: # of mutations belongs to corresponding triplet and sample
+```{r}
+tmp <- filter(snv_filt, treatment == "mock")
+tmp %>%
+  mutate(genotype = factor(genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) ->  tmp
+
+with(tmp, table(genotype, sorting2)) %>% t() %>% as.data.frame.matrix() %>% as.matrix() ->  mut_mat
+
+rownames(mut_mat) %>% strsplit(split = "\\[|\\]") %>% do.call(rbind.data.frame, .) ->  df
+colnames(df) <- c("a", "b", "c")
+arrange(df, b, a, c) %>% apply(1, function(x) paste0(x[1], "[", x[2], ']', x[3])) ->  rn
+
+names = paste(rep(c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ), each = 3), rep(1:3, times = 8), sep = "_clone")
+
+mut_mat <- mut_mat[rn,]     
+
+write.table(mut_mat, paste0(outDir, "/analysis/data_output/mutmat_sample.txt"))
+
+cos_sim_matrix(mut_mat, mut_mat) %>% write.csv(.,  paste0(outDir, "/analysis/data_output/_cos_sim_matrix.csv"), quote = FALSE)
+
+```
+
+### Cosine similarity of samples
+```{r}
+
+plot_cosine_heatmap2(cos_sim_matrix(mut_mat, mut_mat), cluster_cols = TRUE, plot_values = TRUE, min = 0.75) ->  sig_heatmap
+
+ggsave(file.path(outDir, "plots/MutPat_plots/202301_Polpaper_sig_cat_heatmap.pdf"), sig_heatmap, width = 8, height = 5, unit = "in")
+```
+
+### NMF
+```{r}
+estimate <- nmf(mut_mat, rank = 1:5, method = "brunet", nrun = 50)
+plot(estimate)
+```
+
+
+```{r}
+nmf_res_2 <- extract_signatures(mut_mat, rank = 2, nrun = 100)
+nmf_res_3 <- extract_signatures(mut_mat, rank = 3, nrun = 100)
+```
+
+### Modification of plot_contribution plotter function to add decomposition scores to plots
+```{r}
+plot_contribution_with_scores <- function(contribution,
+                              signatures = NA,
+                              scores = NA,
+                              index = NA,
+                              coord_flip = FALSE,
+                              mode = c("relative", "absolute"),
+                              palette = NA) {
+  # check mode parameter
+  mode <- match.arg(mode)
+
+  # optional subsetting if index parameter is provided
+  if (!.is_na(index)) {
+    contribution <- contribution[, index, drop = FALSE]
+  }
+
+  # These variables use non standard evaluation.
+  # To avoid R CMD check complaints we initialize them to NULL.
+  Sample <- Contribution <- Signature <- NULL
+
+  # When working on NMF results, the contribution needs to be multiplied by the signature colSums.
+  if (mode == "absolute" & !.is_na(signatures)) {
+    # calculate signature contribution in absolute number of signatures
+    total_signatures <- colSums(signatures)
+    abs_contribution <- contribution * total_signatures
+  }
+
+  # Make data long. Also create factors for ordering.
+  tb <- contribution %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("Signature") %>%
+    tidyr::pivot_longer(-Signature, names_to = "Sample", values_to = "Contribution") %>%
+    dplyr::mutate(
+      Sample = factor(Sample, levels = unique(Sample)),
+      Signature = factor(Signature, levels = unique(Signature))
+    )
+
+  # Different plotting between absolute and relative
+  if (mode == "absolute") {
+    bar_geom <- geom_bar(stat = "identity", colour = "black")
+    y_lab <- "Absolute contribution \n (no. mutations)"
+  } else if (mode == "relative") {
+    bar_geom <- geom_bar(position = "fill", stat = "identity", colour = "black")
+    y_lab <- "Relative contribution"
+  }
+  
+  # Determine what signatures are present for the legend.
+  present_sigs <- tb %>% 
+    dplyr::filter(Contribution != 0) %>% 
+    dplyr::pull(Signature) %>% 
+    unique()
+  
+  #Create plot
+  plot <- ggplot(tb, aes(x = Sample, y = Contribution, fill = Signature)) +
+    bar_geom +
+    labs(x = "", y = y_lab) +
+    scale_fill_discrete(breaks = present_sigs) +
+    theme_bw() +
+    geom_text(data = scores, aes(x = rownames(scores), y = 0.25, label=score), size=3, show.legend = FALSE) +
+    theme(
+      panel.grid.minor.x = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      panel.grid.major.y = element_blank()
+    )
+
+  # Allow custom color palettes.
+  if (!.is_na(palette)) {
+    plot <- plot + scale_fill_manual(name = "Signature", values = palette)
+  }
+
+  # Handle coord_flip.
+  if (coord_flip) {
+    plot <- plot + coord_flip() + xlim(rev(levels(factor(tb$Sample))))
+  } else {
+    plot <- plot + xlim(levels(factor(tb$Sample)))
+  }
+
+  return(plot)
+}
+
+.is_na <- function(x) {
+  purrr::is_scalar_vector(x) && is.na(x)
+}
+```
+
+```{r}
+colnames(nmf_res_2$signatures) <- rownames(nmf_res_2$contribution) <- c("SigA", "SigB")
+colnames(nmf_res_3$signatures) <- rownames(nmf_res_3$contribution) <- c("SigA", "SigB","SigC")
+
+scores2 = diag(cos_sim_matrix(mut_mat, nmf_res_2$reconstructed)) %>% round(3) %>% as.data.frame()
+colnames(scores) = "score"
+
+scores3 = diag(cos_sim_matrix(mut_mat, nmf_res_3$reconstructed)) %>% round(3) %>% as.data.frame()
+colnames(scores) = "score"
+
+
+plot_96_profile(nmf_res_2$signatures, ymax = 0.1) -> nmf_plot_2_profile
+plot_96_profile(nmf_res_3$signatures, ymax = 0.1) -> nmf_plot_3_profile
+
+plot_contribution_with_scores(nmf_res_2$contribution, 
+                              nmf_res_2$signature, 
+                              scores = scores2,
+                              mode = "absolute", 
+                              coord_flip = TRUE) -> nmf_plot_2_contribution
+
+plot_contribution_with_scores(nmf_res_3$contribution, 
+                              nmf_res_3$signature, 
+                              scores = scores3,
+                              mode = "absolute", 
+                              coord_flip = TRUE) -> nmf_plot_3_contribution
+
+
+for (i in grep("^nmf_plot", ls(), value = TRUE)) {
+  ggsave(file.path(outDir, paste0("/plots/NMF_plots/202301_Polpaper_",i, ".pdf")), get(i), width = 15, height = 10)
+}
+
+write.table(nmf_res_2$signatures, paste0(outDir, "/analysis/data_output/nmf_signatures_2.txt"))
+write.table(nmf_res_2$contribution, paste0(outDir, "/analysis/data_output/nmf_contribution_2.txt"))
+write.table(nmf_res_2$reconstructed, paste0(outDir, "/analysis/data_output/nmf_reconstructed_2.txt"))
+```
+
+
+### Plotting mined signatures using our schema
+```{r}
+t(nmf_res_2$signatures) -> to_plot
+to_plot <- to_plot/sum(to_plot)*100
+to_plot %>% as.data.frame() -> to_plot
+to_plot$Treatment <- "Sig"
+to_plot$Genotype <- rownames(to_plot)
+
+
+trips <- colnames(to_plot)[-c(97,98)] 
+trips <- paste0(substr(trips, 1, 1), substr(trips, 3, 3), substr(trips, 7, 7))
+
+dir.create(paste0(outDir, "/plots/averaged_spectrum_plots/"), recursive = TRUE)
+for (i in 1:nrow(to_plot)) {
+  pdf(paste0(outDir, "/plots/averaged_spectrum_plots/", paste(to_plot[i,97:98], collapse = "_"), "_averaged.pdf"), width = 20, height = 7)
+  opar <- par()
+  par(mar = c(5.1, 7.1, 4.1, 2.1))
+  yscale <- c(0,max(as.numeric(as.matrix(to_plot[,1:96])))*1.2)
+  barplot(as.numeric(to_plot[i,1:96]), 
+          main = paste(to_plot[i,98], collapse = "_"), 
+          col = rep(colors, each = 16), 
+          las = 2, 
+          names.arg = trips, 
+          cex.names = 1.3, 
+          space = spaces, 
+          cex.main = 2, 
+          ylim = yscale, 
+          border = NA, 
+          cex.axis = 1.6, 
+          family = "mono", 
+          lwd = 8)
+   for (j in 1:6) {
+    rect(xleft = 2 + (j-1) * (2 + (16*1 + 15*0.4)), ybottom = (par("usr")[4] - par("usr")[3]) * 0.97, xright = j * (15*1.4 + 2 + 1), ytop = par("usr")[4], col = colors[j], border = NA)
+    text(label = c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G")[j], x = (j - 1) * (15*1.4 + 2) + j + 11.5, y = (par("usr")[4] - par("usr")[3]) * 0.93, cex = 2, font = 2, family = "mono")
+  }
+  dev.off()
+}
+
+```
+
+
+### Cosine similarity of signatures with COSMIC signatures
+```{r}
+sig2 <- read.delim("analysis/data_input/COSMIC_v2_SBS_GRCh38.txt")
+sig3 <- read.delim("analysis/data_input/COSMIC_v3.3.1_SBS_GRCh38.txt")
+
+mock1 <- nmf_res_2$signatures[sig2$Type,]
+mock2 <- nmf_res_2$signatures[sig3$Type,]
+
+
+#write.table(cos_sim_matrix(mock, sig[,-1]), file = "RPE_NMF_cos_sim_to_COSMIC_3.txt", sep = ",", quote = FALSE)
+plot_cosine_heatmap(cos_sim_matrix(mock1, sig2[,-1])) -> heatmap_sig2_cosmic2
+plot_cosine_heatmap(cos_sim_matrix(mock2, sig3[,-1])) -> heatmap_sig2_cosmic3
+
+
+mock1 <- nmf_res_3$signatures[sig2$Type,]
+mock2 <- nmf_res_3$signatures[sig3$Type,]
+
+
+#write.table(cos_sim_matrix(mock, sig[,-1]), file = "RPE_NMF_cos_sim_to_COSMIC_3.txt", sep = ",", quote = FALSE)
+plot_cosine_heatmap(cos_sim_matrix(mock1, sig2[,-1])) -> heatmap_sig3_cosmic2
+plot_cosine_heatmap(cos_sim_matrix(mock2, sig3[,-1])) -> heatmap_sig3_cosmic3
+
+
+for (i in grep("^heatmap", ls(), value = TRUE)) {
+  ggsave(file.path(outDir, paste0("/plots/NMF_plots/202301_Polpaper_",i, ".pdf")), get(i), width = 12, height = 6)
+}
+
+sigs <- nmf_res_2$signatures
+matsigs = as.matrix(sigs[, c("SigA", "SigB")])
+rownames(matsigs) = sigs$Mut
+sigs = matsigs[sig3$Type,]
+
+selected = as.matrix(cbind(sig3[, c("SBS3", "SBS18", "SBS36", "SBS40")], sigs))
+
+plot_cosine_heatmap(cos_sim_matrix(selected, selected), cluster_cols = TRUE, plot_values = TRUE) %>% 
+  ggsave(file.path(outDir, "/plots/NMF_plots/202301_Polpaper_signatures_heatmap.pdf"), ., width = 6, height = 4)
+
+```
+
+### Plotting efficiency of reconstructions
+```{r}
+plot_original_vs_reconstructed(mut_mat, nmf_res_2$reconstructed, 
+                               y_intercept = 0.9) -> cos_recons_2
+
+plot_original_vs_reconstructed(mut_mat, nmf_res_3$reconstructed, 
+                               y_intercept = 0.9) -> cos_recons_3
+
+
+for (i in grep("^cos_recons", ls(), value = TRUE)) {
+  ggsave(file.path(outDir, paste0("plots/NMF_plots/",i, ".pdf")), get(i) ,width = 12, height = 7)
+}
+```
+
+
+### Signature summary
+```{r}
+tmp <- nmf_res_2$contribution %>%
+  as.data.frame() %>%
+    tibble::rownames_to_column("Signature") %>%
+  tidyr::pivot_longer(-Signature, names_to = "Sample", values_to = "Contribution") %>%
+  dplyr::mutate(
+    Sample = factor(Sample, levels = unique(Sample)),
+    Signature = factor(Signature, levels = unique(Signature))) 
+
+
+tmp$Genotype <- str_replace(tmp$Sample, "_clone[123]", "")
+
+tmp$Contribution <- tmp$Contribution*rep(colSums(nmf_res_2$signatures), each = (nrow(tmp)/2))
+
+present_sigs <- tmp %>% 
+  dplyr::filter(Contribution != 0) %>% 
+  dplyr::pull(Signature) %>% 
+  unique()
+
+
+
+#tmp$Genotype = stringr::str_replace(tmp$Genotype, "REV1_PRIMPOL_13", "REV1_PRIMPOL")
+
+tmp %>%
+  mutate(Genotype = factor(Genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) -> tmp
+  
+
+tmp %>%
+  group_by(Genotype, Signature) %>%
+    #mutate(Genotype = factor(Genotype, levels = c("WT_P53",  "REV1","REV3L","PRIMPOL", "REV1_PRIMPOL","EXO1","BRCA1", "BRCA1_REV1","BRCA1_PRIMPOL", "BRCA1_EXO1"))) %>% 
+  summarize(avg_cont = mean(Contribution),
+         sd_cont = sd(Contribution)) -> tmp2
+
+
+write.csv(tmp,  paste0(outDir, "/analysis/data_output/_sig_numbers.csv"), quote = FALSE, row.names = FALSE)
+
+gtypes = c("WT_P53","REV1","REV3L","PRIMPOL","K164R","REV1_PRIMPOL","K164R_PRIMPOL","K164R_REV1")
+
+
+for (i in 1:length(gtypes)){
+  for (j in 1:length(colnames(nmf_res_2$signatures))){
+    
+    sig = colnames(nmf_res_2$signatures)[j]
+    gtype = gtypes[i]
+    #print(gtype)
+    x = tmp[(tmp$Genotype == gtype & tmp$Signature == sig),]$Contribution
+    y = tmp[(tmp$Genotype == "WT_P53" & tmp$Signature == sig),]$Contribution
+    
+    #print(paste0("sample: ",round(mean(x), 2), " +/-" , round(sd(x), 2)))
+    #print(paste0("control: ",round(mean(y), 2), " +/-" , round(sd(y), 2)))
+  
+    test <- t.test(x = x, y = y, var.equal = TRUE)
+    print(paste(gtype, sig, test$p.value, sep = " "))
+
+    # print("Finished")
+    # print("")
+  }
+}
+
+
+tmp2 %>%
+  #mutate(Genotype = factor(Genotype, levels = c("WT_P53",  "REV1","REV3L","PRIMPOL", "REV1_PRIMPOL","EXO1","BRCA1", "BRCA1_REV1","BRCA1_PRIMPOL", "BRCA1_EXO1" ))) %>% 
+  ggplot(aes(x = Genotype, y = avg_cont, fill = Signature)) +
+  geom_bar(stat = "identity", 
+           alpha = 0.4,
+           show.legend = FALSE) +
+  geom_errorbar(aes(ymin = avg_cont-sd_cont, ymax = avg_cont+sd_cont), 
+                position = position_dodge(width = 0.9), 
+                width = 0.3) +
+  geom_point(data = tmp, aes(x = Genotype, y = Contribution), 
+             color = "red", 
+             show.legend = FALSE, 
+             position=position_jitterdodge(jitter.width=0.5), 
+             size = 2,) +
+  theme_bw() +
+  theme(
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.grid.major.y = element_blank()
+  ) +
+  facet_wrap(~Signature, nrow = 3) +
+  theme(axis.text.x = element_text(angle = 45, size = 12, hjust = 1, face = "bold"),
+        text = element_text(face = "bold", size = 12)) +
+  xlab("Genotype") + 
+  ylab("Contribution") + 
+  ggtitle("Contribution of mutation signatures") -> sig_contr_2
+
+tmp <- nmf_res_3$contribution %>%
+  as.data.frame() %>%
+    tibble::rownames_to_column("Signature") %>%
+  tidyr::pivot_longer(-Signature, names_to = "Sample", values_to = "Contribution") %>%
+  dplyr::mutate(
+    Sample = factor(Sample, levels = unique(Sample)),
+    Signature = factor(Signature, levels = unique(Signature))
+  ) 
+
+
+tmp$Genotype <- str_replace(tmp$Sample, "_clone[123]", "")
+
+tmp$Contribution <- tmp$Contribution*rep(colSums(nmf_res_3$signatures), each = (nrow(tmp)/3))
+present_sigs <- tmp %>% 
+  dplyr::filter(Contribution != 0) %>% 
+  dplyr::pull(Signature) %>% 
+  unique()
+
+
+
+#tmp$Genotype = stringr::str_replace(tmp$Genotype, "REV1_PRIMPOL_13", "REV1_PRIMPOL")
+
+tmp %>%
+  mutate(Genotype = factor(Genotype, levels = c("WT_P53", "REV1","REV3L","PRIMPOL", "K164R","REV1_PRIMPOL", "K164R_PRIMPOL",  "K164R_REV1" ))) -> tmp
+  
+
+tmp %>%
+  group_by(Genotype, Signature) %>%
+    #mutate(Genotype = factor(Genotype, levels = c("WT_P53",  "REV1","REV3L","PRIMPOL", "REV1_PRIMPOL","EXO1","BRCA1", "BRCA1_REV1","BRCA1_PRIMPOL", "BRCA1_EXO1"))) %>% 
+  summarize(avg_cont = mean(Contribution),
+         sd_cont = sd(Contribution))-tmp2
+
+
+
+tmp2 %>%
+  #mutate(Genotype = factor(Genotype, levels = c("WT_P53",  "REV1","REV3L","PRIMPOL", "REV1_PRIMPOL","EXO1","BRCA1", "BRCA1_REV1","BRCA1_PRIMPOL", "BRCA1_EXO1" ))) %>% 
+  ggplot(aes(x = Genotype, y = avg_cont, fill = Signature)) +
+  geom_bar(stat = "identity", 
+           alpha = 0.4,
+           show.legend = FALSE) +
+  geom_errorbar(aes(ymin = avg_cont-sd_cont, ymax = avg_cont+sd_cont), 
+                position = position_dodge(width = 0.9), 
+                width = 0.3) +
+  geom_point(data = tmp, aes(x = Genotype, y = Contribution), 
+             color = "red", 
+             show.legend = FALSE, 
+             position=position_jitterdodge(jitter.width=0.5), 
+             size = 2,) +
+  theme_bw() +
+  theme(
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.grid.major.y = element_blank()
+  ) +
+  facet_wrap(~Signature, nrow = 3) +
+  theme(axis.text.x = element_text(angle = 45, size = 12, hjust = 1, face = "bold"),
+        text = element_text(face = "bold", size = 12)) +
+  xlab("Genotype") + 
+  ylab("Contribution") + 
+  ggtitle("Contribution of mutation signatures") -> sig_contr_3
+
+
+for (i in grep("^sig_cont", ls(), value = TRUE)) {
+  ggsave(file.path(outDir, paste0("plots/NMF_plots/",i, ".pdf")), get(i) ,width = 5, height = 12)
+}
+```
+
+
+```{r}
+snv_spectra_for_deconstr <- mut_mat
+snv_spectra_for_deconstr$numberofmut <- rowSums(snv_spectra_for_deconstr[,1:96])
+
+sig_important <- sig3[, c("SigA", "SigB")]
+sig_others <- sig3[,!(colnames(sig3) %in% c("SBS3","SBS40","SBS18"))]
+sig_all <- nmf_res_2$signatures
+
+colscheme <- c("bisque1","burlywood2","cadetblue3",paste0("grey",24:99))
+
+
+
+
+  fit_res <- fit_to_signatures_strict(t(snv_spectra_for_deconstr[,1:96]), sig_all, max_delta = 0.004)
+   fit_res <- fit_res$fit_res
+
+   df <- fit_res$contribution
+   df <- prop.table(df, margin=2)
+   
+   df_abs <- df
+   for(i in 1:nrow(df_abs)){
+     for(j in 1:ncol(df_abs)){
+       df_abs[i,j] <- df[i,j]*snv_spectra_for_deconstr[colnames(df_abs)[j],"numberofmut"]
+     }
+   }
+   
+   df <- data.table::melt(df)
+   colnames(df) <- c("signature","sample", "value")
+   df_abs <- data.table::melt(df_abs)
+   colnames(df_abs) <- c("signature","sample","value")
+   
+    cossim_all <- data.frame(matrix(0, nrow = 0, ncol = 1))
+   for(i in 1: ncol(fit_res$reconstructed)){
+     sample <- colnames(fit_res$reconstructed)[i]
+     cossim <- round(cos_sim(t(snv_spectra_for_deconstr[,1:96])[,sample], fit_res$reconstructed[,sample]), digits = 3)
+     cossim_all <- rbind(cossim_all, cossim)
+   }
+  row.names(cossim_all) <- row.names(mutmat)
+  cossim_all$sample <- row.names(cossim_all)
+  colnames(cossim_all) <- c("cossim","sample")
+
+   p <- ggplot(
+           df_abs, aes(y = value, x = sample)) +
+           geom_bar(aes(fill = signature), stat="identity", position = position_stack(reverse = TRUE), colour="black") +
+           geom_text(data=subset(df_abs,value != 0), aes(label=substr(signature, 4, 5)), position = position_stack(vjust = 0.5), size=2) +
+           geom_text(data = cossim_all, aes(x = sample, y = 2500, label=cossim), size=4) +
+           theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(),
+             axis.line = element_line(colour = "black"), axis.text.x = element_text(angle = 90, hjust = 1, size = 5), legend.text = element_text(size = 5)) +
+           scale_fill_manual(values = colscheme )
+
+ ggsave(paste0(outDir, "/plots/MutPat_plots/deconstr_nmf_sigs_2.pdf"), p, width = 8, height = 6)
+ 
+ 
+  p <- ggplot(
+           df, aes(y = value, x = sample)) +
+           geom_bar(aes(fill = signature), stat="identity", position = position_stack(reverse = TRUE), colour="black") +
+           geom_text(data=subset(df,value != 0), aes(label=substr(signature, 4, 5)), position = position_stack(vjust = 0.5), size=2) +
+           geom_text(data = cossim_all, aes(x = sample, y = 1.2, label=cossim), size=4) +
+           theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(),
+             axis.line = element_line(colour = "black"), axis.text.x = element_text(angle = 90, hjust = 1, size = 5), legend.text = element_text(size = 5)) +
+           scale_fill_manual(values = colscheme )
+
+ ggsave(paste0(outDir, "/plots/MutPat_plots/deconstr_2.pdf"), p, width = 8, height = 7)
+```
+### PCA 
+```{r}
+apply(mut_mat, 2, function(x) x = x/sum(x) ) -> mut_mat_pca
+as.data.frame(t(mut_mat_pca)) -> MMR_pca
+MMR_pca$sample <- rownames(MMR_pca)
+
+MMR_pca$sample <- gsub("_RMdup_IR.bam", "", MMR_pca$sample)
+
+MMR_pca$genotype <- apply(MMR_pca, 1, function(x) substr(x[97], 1, 4))
+
+for (i in 1:length(genotypes)) {
+  MMR_pca[which(MMR_pca$sample %in% genotypes[[i]]), "genotype"] <- names(genotypes)[i]  
+}
+
+pca <- prcomp(MMR_pca[,1:32])
+
+autoplot(pca, 
+         data = MMR_pca, 
+         colour = "genotype")
+```

@@ -1,0 +1,466 @@
+
+```{r}
+
+library(ggplot2)
+library(dplyr)
+library(MutationalPatterns)
+
+```
+
+```{r}
+
+normalizeGenomicPositions <- function(chr, pos) {
+  pos <- as.numeric(pos)
+  whichChrom <- which(seqNames %in% chr)
+  earlierChromsLength <- sum(seqLengths[0:(whichChrom - 1)])
+  return(as.numeric(earlierChromsLength) + pos)
+}
+
+```
+
+```{r}
+
+workdir <- ""
+snv_filt <- read.table("snv_filt.dat", header = T)
+
+
+```
+
+
+### Replication timing - HEPG2
+
+```{r}
+
+# create output directories
+
+  dir.create(paste0(workdir, "/plots/replication_timing/"))
+  dir.create(paste0(workdir, "/plots/replication_timing/ref_HEPG2"))
+  dir.create(paste0(workdir, "/plots/replication_timing/ref_HEPG2/deconstr"))
+
+# import data
+
+  repl_time_data_1 <- import.bedGraph("RT_HepG2_Hepatocellular Carcinoma_Int49277082_hg38.bedgraph")
+  repl_time_data <- as.data.frame(repl_time_data_1)
+  repl_time_data <- filter(repl_time_data, seqnames %in% c(paste0("chr", c(1:22, "X","Y"))))
+  
+
+# interpolation based on the "start" positions:
+
+  repl_time_data$chr <- repl_time_data$seqnames
+  repl_time_data$pos <- repl_time_data$start
+  repl_time_data$normPos <- apply(repl_time_data, 1, function(x) normalizeGenomicPositions(x[7], x[8]))
+  
+  fn_interpolate <- approxfun(repl_time_data$normPos, repl_time_data$score, method = "linear")
+  
+  snv_filt$repl_timing <- fn_interpolate(snv_filt$normPos)
+
+
+
+###########################################################################
+
+# deciles of genome
+
+  tmp <- sort(repl_time_data$score)
+  a <- round(length(tmp)/10,0)
+  num_deciles <- c(1,a,2*a,3*a,4*a,5*a,6*a,7*a,8*a,9*a,length(tmp))
+  repl_deciles <- tmp[num_deciles]
+  
+  pdf(paste0(workdir, "/plots/replication_timing/ref_HEPG2/deciles.pdf"))
+    plot(tmp, ylim = c(-6,6))
+    par(new = T)
+    plot(repl_deciles, col = "red", ylim = c(-6,6), pch = 20)
+  dev.off()
+
+
+
+###########################################################################
+
+  # assign replication timing value to mutation sites
+  # generate mutational spectra in deciles
+  # deconstruction
+
+  snv_filt$repl_timing_dec <- cut(snv_filt$repl_timing, breaks = repl_deciles)
+  
+  
+  z = 0
+  for(gt in genotypes){
+     z = z+1
+    for(tr in c("mock")){
+    
+    #generate spectra for each decile
+    
+    tmp <- filter(snv_filt, genotype == gt, treatment == "mock")
+    tmp$sorting <- factor(tmp$sorting, levels = mutnames)
+    x <- as.data.frame.matrix(table(tmp$repl_timing_dec, tmp$sorting))
+    colnames(x) <- colnames(signatures.cosmic)
+    x$numberofmut <- rowSums(x)
+    
+    # deconstruction
+    
+     fit_res <- fit_to_signatures_strict(t(x[1:96]), t(nmf_rank2[,1:96]), max_delta = 0.004)
+     fit_res <- fit_res$fit_res
+     df <- fit_res$contribution
+     df <- prop.table(df, margin=2)
+   
+     df_abs <- df
+     for(i in 1:nrow(df_abs)){
+       for(j in 1:ncol(df_abs)){
+         df_abs[i,j] <- df[i,j]*x[colnames(df_abs)[j],"numberofmut"]
+       }
+     }
+     
+     df <- data.table::melt(df)
+     colnames(df) <- c("signature","sample","value")
+     df_abs <- data.table::melt(df_abs)
+     colnames(df_abs) <- c("signature","sample","value")
+     df_abs$value <- df_abs$value / 3  #normailze to sample number
+   
+   
+      cossim_all <- data.frame(matrix(0, nrow = 0, ncol = 1))
+      for(i in 1: ncol(fit_res$reconstructed)){
+        sample <- colnames(fit_res$reconstructed)[i]
+        cossim <- round(cos_sim(t(x[,1:96])[,sample], fit_res$reconstructed[,sample]), digits = 2)
+        cossim_all <- rbind(cossim_all, cossim)
+      }
+
+      cossim_all$sample <- row.names(cossim_all)
+      colnames(cossim_all) <- c("cossim","sample")
+
+
+      # plot
+      
+      p_a <- ggplot(
+           df_abs, aes(y = value, x = sample)) +
+           geom_bar(aes(fill = signature), stat="identity", position = position_stack(reverse = TRUE), colour="black") + ylim(c(0,200)) +
+           geom_text(data=subset(df_abs,value != 0), aes(label=substr(signature, 11, 11)), position = position_stack(vjust = 0.5), size=4) +
+           geom_text(data = cossim_all, aes(x = c(1:10), y = 190, label=round(rev(cossim)),digits = 2), size=2.75, angle = 90) +
+           ggtitle(gt) + ylab("Number of mutations") + xlab("") +
+           theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+                 panel.background = element_blank(),
+                 axis.line = element_line(colour = "black"), 
+                 axis.text.x = element_text(angle = 90, hjust = 1, size = 5), 
+                 legend.text = element_text(size = 5)) + 
+        scale_x_discrete(limits = rev)
+
+      assign(paste0("plot_a",z), p_a)
+     
+      p_r <- ggplot(
+           df, aes(y = value, x = sample)) +
+           geom_bar(aes(fill = signature), stat="identity", position = position_stack(reverse = TRUE), colour="black") + ylim(c(0,1.1)) +
+           geom_text(data=subset(df,value != 0), aes(label=substr(signature, 11, 11)), position = position_stack(vjust = 0.5), size=4) +
+           geom_text(data = cossim_all, aes(x = c(1:10), y = 1.1, label=round(rev(cossim)),digits = 2), size=2.75, angle = 90) +
+           ggtitle(gt) + ylab("Number of mutations") + xlab("") +
+           theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+                 panel.background = element_blank(),
+                 axis.line = element_line(colour = "black"), 
+                 axis.text.x = element_text(angle = 90, hjust = 1, size = 5), 
+                 legend.text = element_text(size = 5)) + 
+        scale_x_discrete(limits = rev)
+      
+      assign(paste0("plot_r",z), p_r)
+  }
+}
+
+  
+
+# separate plot for all mutations merged into one data frame
+
+
+  # generate spectra for each decile
+
+    tmp <- filter(snv_filt,  treatment == "mock")
+    tmp$sorting <- factor(tmp$sorting, levels = mutnames)
+    x <- as.data.frame.matrix(table(tmp$repl_timing_dec, tmp$sorting))
+    colnames(x) <- colnames(signatures.cosmic)
+    x$numberofmut <- rowSums(x)
+    
+  # deconstruction
+
+     fit_res <- fit_to_signatures_strict(t(x[1:96]), t(nmf_rank2[,1:96]), max_delta = 0.004)
+     fit_res <- fit_res$fit_res
+     df <- fit_res$contribution
+     df <- prop.table(df, margin=2)
+   
+     df_abs <- df
+     for(i in 1:nrow(df_abs)){
+       for(j in 1:ncol(df_abs)){
+         df_abs[i,j] <- df[i,j]*x[colnames(df_abs)[j],"numberofmut"]
+       }
+     }
+     
+     df <- data.table::melt(df)
+     colnames(df) <- c("signature","sample","value")
+     df_abs <- data.table::melt(df_abs)
+     colnames(df_abs) <- c("signature","sample","value")
+     df_abs$value <- df_abs$value / 3  #normailze to sample number
+   
+   
+      cossim_all <- data.frame(matrix(0, nrow = 0, ncol = 1))
+      for(i in 1: ncol(fit_res$reconstructed)){
+        sample <- colnames(fit_res$reconstructed)[i]
+        cossim <- round(cos_sim(t(x[,1:96])[,sample], fit_res$reconstructed[,sample]), digits = 2)
+        cossim_all <- rbind(cossim_all, cossim)
+      }
+
+      cossim_all$sample <- row.names(cossim_all)
+      colnames(cossim_all) <- c("cossim","sample")
+
+
+      # plot
+      
+      p_a_all <- ggplot(
+           df_abs, aes(y = value, x = sample)) +
+           geom_bar(aes(fill = signature), stat="identity", position = position_stack(reverse = TRUE), colour="black") + ylim(c(0,1000)) +
+           geom_text(data=subset(df_abs,value != 0), aes(label=substr(signature, 11, 11)), position = position_stack(vjust = 0.5), size=4) +
+           geom_text(data = cossim_all, aes(x = c(1:10), y = 1000, label=round(rev(cossim)),digits = 2), size=2.75, angle = 90) +
+           ggtitle("all mutations") + ylab("Number of mutations") + xlab("") +
+           theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+                 panel.background = element_blank(),
+                 axis.line = element_line(colour = "black"), 
+                 axis.text.x = element_text(angle = 90, hjust = 1, size = 5), 
+                 legend.text = element_text(size = 5)) + 
+        scale_x_discrete(limits = rev)
+
+     
+      p_r_all <- ggplot(
+           df, aes(y = value, x = sample)) +
+           geom_bar(aes(fill = signature), stat="identity", position = position_stack(reverse = TRUE), colour="black") + ylim(c(0,1.1)) +
+           geom_text(data=subset(df,value != 0), aes(label=substr(signature, 11, 11)), position = position_stack(vjust = 0.5), size=4) +
+           geom_text(data = cossim_all, aes(x = c(1:10), y = 1.1, label=round(rev(cossim)),digits = 2), size=2.75, angle = 90) +
+           ggtitle("all mutations") + ylab("Number of mutations") + xlab("") +
+           theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+                 panel.background = element_blank(),
+                 axis.line = element_line(colour = "black"), 
+                 axis.text.x = element_text(angle = 90, hjust = 1, size = 5), 
+                 legend.text = element_text(size = 5)) + 
+        scale_x_discrete(limits = rev)
+      
+
+# grid plot
+          
+    pdf(paste0(workdir, "/plots/replication_timing/ref_HEPG2/deconstr/repl_deconstr_abs_all_HEPG2.pdf"), width = 16, height = 12)
+            gridExtra::grid.arrange(plot_a1,plot_a2,plot_a3,plot_a4,plot_a5,plot_a6,plot_a7,plot_a8,p_a_all, nrow = 3, ncol = 4)
+            dev.off()
+    
+    pdf(paste0(workdir, "/plots/replication_timing/ref_HEPG2/deconstr/repl_deconstr_rel_all_HEPG2.pdf"), width = 16, height = 12)
+            gridExtra::grid.arrange(plot_r1,plot_r2,plot_r3,plot_r4,plot_r5,plot_r6,plot_r7,plot_r8,p_r_all, nrow = 3, ncol = 4)
+            dev.off()
+      
+            
+```
+
+
+### Replication timing - RPE1
+```{r}
+
+# create output directories
+
+  dir.create(paste0(workdir, "/plots/replication_timing/"))
+  dir.create(paste0(workdir, "/plots/replication_timing/ref_RPE1"))
+  dir.create(paste0(workdir, "/plots/replication_timing/ref_RPE1/deconstr"))
+
+# data: 
+
+  repl_time_data_1 <- import.bedGraph("GSE108556_RPE1_rpm_w200ks40k_BrdUIP_Percent_q0.05.bedGraph")
+  repl_time_data <- as.data.frame(repl_time_data_1)
+  repl_time_data$score <- as.numeric(repl_time_data$score)
+
+# interpolation based on the "start" positions:
+
+  repl_time_data$chr <- repl_time_data$seqnames
+  repl_time_data$pos <- repl_time_data$start
+  repl_time_data$normPos <- apply(repl_time_data, 1, function(x) normalizeGenomicPositions(x[7], x[8]))
+  
+  fn_interpolate <- approxfun(repl_time_data$normPos, repl_time_data$score, method = "linear")
+  
+  snv_filt$repl_timing <- fn_interpolate(snv_filt$normPos)
+
+
+###########################################################################
+
+# five equal parts of genome
+
+  tmp <- sort(as.numeric(repl_time_data$score))
+  a <- round(length(tmp)/5,0)
+  num_pent <- c(1,a,2*a,3*a,4*a,length(tmp))
+  repl_pent <- tmp[num_pent]
+
+  pdf(paste0(workdir, "/plots/replication_timing/ref_RPE1/pent.pdf"))
+    plot(tmp, ylim = c(-1,1))
+    par(new = T)
+    plot(repl_pent, col = "red", ylim = c(-1,1), pch = 20)
+  dev.off()
+
+
+###########################################################################
+
+
+snv_filt$repl_timing_pent <- cut(snv_filt$repl_timing, breaks = repl_pent)
+
+  z = 0
+  for(gt in genotypes){
+     z = z+1
+    for(tr in c("mock")){
+    
+    #generate spectra for each part
+    
+    tmp <- filter(snv_filt, genotype == gt, treatment == "mock")
+    tmp$sorting <- factor(tmp$sorting, levels = mutnames)
+    x <- as.data.frame.matrix(table(tmp$repl_timing_pent, tmp$sorting))
+    colnames(x) <- colnames(signatures.cosmic)
+    x$numberofmut <- rowSums(x)
+    
+    # deconstruction
+    
+     fit_res <- fit_to_signatures_strict(t(x[1:96]), t(nmf_rank2[,1:96]), max_delta = 0.004)
+     fit_res <- fit_res$fit_res
+     df <- fit_res$contribution
+     df <- prop.table(df, margin=2)
+   
+     df_abs <- df
+     for(i in 1:nrow(df_abs)){
+       for(j in 1:ncol(df_abs)){
+         df_abs[i,j] <- df[i,j]*x[colnames(df_abs)[j],"numberofmut"]
+       }
+     }
+     
+     df <- data.table::melt(df)
+     colnames(df) <- c("signature","sample","value")
+     df_abs <- data.table::melt(df_abs)
+     colnames(df_abs) <- c("signature","sample","value")
+     df_abs$value <- df_abs$value / 3  #normailze to sample number
+   
+   
+      cossim_all <- data.frame(matrix(0, nrow = 0, ncol = 1))
+      for(i in 1: ncol(fit_res$reconstructed)){
+        sample <- colnames(fit_res$reconstructed)[i]
+        cossim <- round(cos_sim(t(x[,1:96])[,sample], fit_res$reconstructed[,sample]), digits = 2)
+        cossim_all <- rbind(cossim_all, cossim)
+      }
+
+      cossim_all$sample <- row.names(cossim_all)
+      colnames(cossim_all) <- c("cossim","sample")
+
+
+      # plot
+      
+      p_a <- ggplot(
+           df_abs, aes(y = value, x = sample)) +
+           geom_bar(aes(fill = signature), stat="identity", position = position_stack(reverse = TRUE), colour="black") + ylim(c(0,200)) +
+           geom_text(data=subset(df_abs,value != 0), aes(label=substr(signature, 11, 11)), position = position_stack(vjust = 0.5), size=4) +
+           geom_text(data = cossim_all, aes(x = c(1:10), y = 190, label=round(rev(cossim)),digits = 2), size=2.75, angle = 90) +
+           ggtitle(gt) + ylab("Number of mutations") + xlab("") +
+           theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+                 panel.background = element_blank(),
+                 axis.line = element_line(colour = "black"), 
+                 axis.text.x = element_text(angle = 90, hjust = 1, size = 5), 
+                 legend.text = element_text(size = 5)) + 
+        scale_x_discrete(limits = rev)
+
+      assign(paste0("plot_a",z), p_a)
+     
+      p_r <- ggplot(
+           df, aes(y = value, x = sample)) +
+           geom_bar(aes(fill = signature), stat="identity", position = position_stack(reverse = TRUE), colour="black") + ylim(c(0,1.1)) +
+           geom_text(data=subset(df,value != 0), aes(label=substr(signature, 11, 11)), position = position_stack(vjust = 0.5), size=4) +
+           geom_text(data = cossim_all, aes(x = c(1:10), y = 1.1, label=round(rev(cossim)),digits = 2), size=2.75, angle = 90) +
+           ggtitle(gt) + ylab("Number of mutations") + xlab("") +
+           theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+                 panel.background = element_blank(),
+                 axis.line = element_line(colour = "black"), 
+                 axis.text.x = element_text(angle = 90, hjust = 1, size = 5), 
+                 legend.text = element_text(size = 5)) + 
+        scale_x_discrete(limits = rev)
+      
+      assign(paste0("plot_r",z), p_r)
+  }
+}
+
+  
+
+# separate plot for all mutations merged into one data frame
+
+
+  # generate spectra for each part
+
+    tmp <- filter(snv_filt,  treatment == "mock")
+    tmp$sorting <- factor(tmp$sorting, levels = mutnames)
+    x <- as.data.frame.matrix(table(tmp$repl_timing_pent, tmp$sorting))
+    colnames(x) <- colnames(signatures.cosmic)
+    x$numberofmut <- rowSums(x)
+    
+  # deconstruction
+
+     fit_res <- fit_to_signatures_strict(t(x[1:96]), t(nmf_rank2[,1:96]), max_delta = 0.004)
+     fit_res <- fit_res$fit_res
+     df <- fit_res$contribution
+     df <- prop.table(df, margin=2)
+   
+     df_abs <- df
+     for(i in 1:nrow(df_abs)){
+       for(j in 1:ncol(df_abs)){
+         df_abs[i,j] <- df[i,j]*x[colnames(df_abs)[j],"numberofmut"]
+       }
+     }
+     
+     df <- data.table::melt(df)
+     colnames(df) <- c("signature","sample","value")
+     df_abs <- data.table::melt(df_abs)
+     colnames(df_abs) <- c("signature","sample","value")
+     df_abs$value <- df_abs$value / 3  #normailze to sample number
+   
+   
+      cossim_all <- data.frame(matrix(0, nrow = 0, ncol = 1))
+      for(i in 1: ncol(fit_res$reconstructed)){
+        sample <- colnames(fit_res$reconstructed)[i]
+        cossim <- round(cos_sim(t(x[,1:96])[,sample], fit_res$reconstructed[,sample]), digits = 2)
+        cossim_all <- rbind(cossim_all, cossim)
+      }
+
+      cossim_all$sample <- row.names(cossim_all)
+      colnames(cossim_all) <- c("cossim","sample")
+
+
+      # plot
+      
+      p_a_all <- ggplot(
+           df_abs, aes(y = value, x = sample)) +
+           geom_bar(aes(fill = signature), stat="identity", position = position_stack(reverse = TRUE), colour="black") + ylim(c(0,1000)) +
+           geom_text(data=subset(df_abs,value != 0), aes(label=substr(signature, 11, 11)), position = position_stack(vjust = 0.5), size=4) +
+           geom_text(data = cossim_all, aes(x = c(1:10), y = 1000, label=round(rev(cossim)),digits = 2), size=2.75, angle = 90) +
+           ggtitle("all mutations") + ylab("Number of mutations") + xlab("") +
+           theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+                 panel.background = element_blank(),
+                 axis.line = element_line(colour = "black"), 
+                 axis.text.x = element_text(angle = 90, hjust = 1, size = 5), 
+                 legend.text = element_text(size = 5)) + 
+        scale_x_discrete(limits = rev)
+
+     
+      p_r_all <- ggplot(
+           df, aes(y = value, x = sample)) +
+           geom_bar(aes(fill = signature), stat="identity", position = position_stack(reverse = TRUE), colour="black") + ylim(c(0,1.1)) +
+           geom_text(data=subset(df,value != 0), aes(label=substr(signature, 11, 11)), position = position_stack(vjust = 0.5), size=4) +
+           geom_text(data = cossim_all, aes(x = c(1:10), y = 1.1, label=round(rev(cossim)),digits = 2), size=2.75, angle = 90) +
+           ggtitle("all mutations") + ylab("Number of mutations") + xlab("") +
+           theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+                 panel.background = element_blank(),
+                 axis.line = element_line(colour = "black"), 
+                 axis.text.x = element_text(angle = 90, hjust = 1, size = 5), 
+                 legend.text = element_text(size = 5)) + 
+        scale_x_discrete(limits = rev)
+      
+
+# grid plot
+          
+    pdf(paste0(workdir, "/plots/replication_timing/ref_RPE1/deconstr/repl_deconstr_abs_all_RPE1.pdf"), width = 16, height = 12)
+            gridExtra::grid.arrange(plot_a1,plot_a2,plot_a3,plot_a4,plot_a5,plot_a6,plot_a7,plot_a8,p_a_all, nrow = 3, ncol = 4)
+            dev.off()
+    
+    pdf(paste0(workdir, "/plots/replication_timing/ref_RPE1/deconstr/repl_deconstr_rel_all_RPE1.pdf"), width = 16, height = 12)
+            gridExtra::grid.arrange(plot_r1,plot_r2,plot_r3,plot_r4,plot_r5,plot_r6,plot_r7,plot_r8,p_r_all, nrow = 3, ncol = 4)
+            dev.off()
+      
+            
+
+```
